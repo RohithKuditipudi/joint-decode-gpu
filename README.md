@@ -1,0 +1,110 @@
+# joint-decode-gpu
+
+Standalone GPU joint decoding for two vLLM models that share a tokenizer.
+
+At each decode step, worker A and worker B each send top-k logits for the same
+active request ids to a parent HTTP coordinator. The coordinator chooses one
+token per request. Each worker then masks its logits so vLLM emits that exact
+token. Output text is taken from worker A.
+
+## Install
+
+From this directory:
+
+```bash
+pip install -e .
+```
+
+The project declares `vllm>=0.11.0`. Use the same vLLM version/range that the
+GPU integration test is run against.
+
+## CLI
+
+We provide a CLI as a simple end-to-end demonstration.
+
+```bash
+joint-decode-gpu --output completions.jsonl
+```
+
+Important flags:
+
+- `--model-a`, `--model-b`: model paths or HF ids. Tokenizer vocab size and EOS
+  id must match.
+- `--gpu-a`, `--gpu-b`: physical GPU ids. The parent sets
+  `CUDA_VISIBLE_DEVICES` separately for each worker.
+- `--top-k-a`, `--top-k-b`: top-k payload size each worker sends to the
+  coordinator.
+- `--advisor-weight`: weight on model B in the default average-logits rule.
+  Model A weight is `1 - advisor_weight`.
+- `--temperature`: joint sampling temperature used by the coordinator.
+- `--microbatch-size`: number of prompts sent to both workers at a time.
+  (small enough so that both engines can process all prompts together;
+  otherwise will cause a stall due to scheduler divergence)
+- `--prompts`: path to JSONL file.
+  Each row must contain `id`, `prompt_a`, and `prompt_b` —
+  `prompt_a` is fed to model A, `prompt_b` to model B. They can differ (e.g.
+  different chat templates or system prompts) while the two models share one
+  forced continuation:
+
+  ```json
+  {"id": "p0", "prompt_a": "Write a short proof that...", "prompt_b": "Write a short proof that..."}
+  {"id": "p1", "prompt_a": "Explain why...", "prompt_b": "Explain why..."}
+  ```
+
+The CLI writes JSONL, one row per input row in input order:
+
+```json
+{"id": "p0", "prompt_a": "...", "prompt_b": "...", "completion": "...", "finish_reason": "..."}
+```
+
+`completion` is the shared forced continuation, detokenized by model A.
+
+## Custom Aggregation
+
+The CLI uses average-logits aggregation. Experiments can bypass the CLI and call
+`run_joint_decode` directly with their own token selector. A selector can be
+an arbitrary function that takes two lists of tokens and associated logits
+(i.e., the top-k tokens from each model) as well as an RNG instance and returns
+a selected token. For example:
+
+```python
+import random
+from typing import Any
+
+from joint_decode_gpu.coordinator import run_joint_decode
+
+def select_dumb(
+    a_topk: list[dict[str, Any]], # [{"token_id": int, "logit": float},...]
+    b_topk: list[dict[str, Any]],
+    *,
+    rng: random.Random,
+):
+  return a_topk[0]["token_id"]
+
+outputs = run_joint_decode(
+    config,
+    prompts_a,
+    prompts_b,
+    select_token=select_dumb
+)
+```
+
+We have the option of running the two models with different prompts. This is
+useful for when we want to provide hints (in the prompt) to the second model.
+
+## Tests
+
+The core correctness test is a single-worker vLLM workload with a deterministic
+HTTP decision coordinator. It forces distinct token streams per request id and
+asserts vLLM outputs by request id. This tests the GPU-specific row-to-request-id
+mapping in `JointDecodeLogitsProcessor`.
+
+Run it with a local tiny vLLM-compatible model:
+
+```bash
+JOINT_DECODE_GPU_TEST_MODEL=/path/to/tiny-model \
+PYTHONPATH=src \
+pytest -q tests/test_joint_decode_logits_processor_gpu.py -m gpu
+```
+
+Without `JOINT_DECODE_GPU_TEST_MODEL`, the test skips.

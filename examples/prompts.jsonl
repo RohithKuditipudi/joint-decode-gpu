@@ -1,0 +1,2 @@
+{"id": "p0", "prompt_a": "Explain why averaging logits can change the sampled token.", "prompt_b": "Explain why averaging logits can change the sampled token."}
+{"id": "p1", "prompt_a": "Write a concise explanation of CUDA graph capture.", "prompt_b": "Write a concise explanation of CUDA graph capture."}
