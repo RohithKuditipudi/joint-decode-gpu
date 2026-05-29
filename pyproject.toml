@@ -13,11 +13,17 @@ dependencies = [
   "fsspec",
 ]
 
+[dependency-groups]
+dev = [
+  "pytest",
+]
+
 [project.scripts]
 joint-decode-gpu = "joint_decode_gpu.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 markers = [
   "gpu: requires a CUDA GPU and a local vLLM-compatible model",
 ]
