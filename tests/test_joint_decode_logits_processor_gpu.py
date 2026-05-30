@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
+import torch.distributed as dist
 
 from joint_decode_gpu.config import VLLM_GPU_ENV_VARS
 
@@ -75,6 +76,9 @@ def test_forced_tokens_stay_attached_to_request_ids_under_real_vllm(monkeypatch:
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
     for rid, script in scripts.items():
         assert list(results[rid].token_ids) == script

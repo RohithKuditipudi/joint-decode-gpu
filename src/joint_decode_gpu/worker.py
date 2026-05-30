@@ -7,6 +7,8 @@ import os
 import sys
 from typing import Any
 
+import torch.distributed as dist
+
 from joint_decode_gpu.config import VLLM_GPU_ENV_VARS
 from joint_decode_gpu.ipc import emit_ipc
 
@@ -24,7 +26,12 @@ def main() -> None:
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--stop", default=None)
     args = parser.parse_args()
-    run_worker(args)
+
+    try:
+        run_worker(args)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def run_worker(args: argparse.Namespace) -> None:
