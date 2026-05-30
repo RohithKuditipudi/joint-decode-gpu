@@ -41,7 +41,7 @@ def run_worker(args: argparse.Namespace) -> None:
         format="%(asctime)s %(levelname)s [worker pid=%(process)d] %(message)s",
     )
     for key, value in VLLM_GPU_ENV_VARS.items():
-        os.environ.setdefault(key, value)
+        os.environ[key] = value
 
     from vllm import LLM, SamplingParams
 

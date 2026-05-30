@@ -152,7 +152,7 @@ class JointDecoder:
         env["RERANK_TOKEN_DECISION_TOP_K"] = str(top_k)
         env["RERANK_TOKEN_DECISION_TIMEOUT"] = str(self.config.sampling.barrier_timeout_s + 10.0)
         for key, value in VLLM_GPU_ENV_VARS.items():
-            env.setdefault(key, value)
+            env[key] = value
 
         cmd = [
             sys.executable,
