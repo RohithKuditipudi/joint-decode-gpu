@@ -152,7 +152,7 @@ class JointDecoder:
         env["RERANK_TOKEN_DECISION_TOP_K"] = str(top_k)
         env["RERANK_TOKEN_DECISION_TIMEOUT"] = str(self.config.sampling.barrier_timeout_s + 10.0)
         for key, value in VLLM_GPU_ENV_VARS.items():
-            env.setdefault(key, value)
+            env[key] = value
 
         cmd = [
             sys.executable,
@@ -172,6 +172,8 @@ class JointDecoder:
             cmd += ["--gpu-memory-utilization", str(model_config.gpu_memory_utilization)]
         if model_config.enable_prefix_caching:
             cmd.append("--enable-prefix-caching")
+        if model_config.enforce_eager:
+            cmd.append("--enforce-eager")
         if self.config.sampling.stop:
             cmd += ["--stop", json.dumps(list(self.config.sampling.stop))]
 

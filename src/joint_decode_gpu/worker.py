@@ -7,6 +7,8 @@ import os
 import sys
 from typing import Any
 
+import torch.distributed as dist
+
 from joint_decode_gpu.config import VLLM_GPU_ENV_VARS
 from joint_decode_gpu.ipc import emit_ipc
 
@@ -21,9 +23,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--gpu-memory-utilization", type=float, default=None)
     parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--stop", default=None)
     args = parser.parse_args()
-    run_worker(args)
+
+    try:
+        run_worker(args)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def run_worker(args: argparse.Namespace) -> None:
@@ -33,7 +41,7 @@ def run_worker(args: argparse.Namespace) -> None:
         format="%(asctime)s %(levelname)s [worker pid=%(process)d] %(message)s",
     )
     for key, value in VLLM_GPU_ENV_VARS.items():
-        os.environ.setdefault(key, value)
+        os.environ[key] = value
 
     from vllm import LLM, SamplingParams
 
@@ -46,6 +54,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "tensor_parallel_size": 1,
         "max_model_len": args.max_model_len,
         "enable_prefix_caching": args.enable_prefix_caching,
+        "enforce_eager": args.enforce_eager,
         "logits_processors": [JointDecodeLogitsProcessor],
     }
     if args.gpu_memory_utilization is not None:

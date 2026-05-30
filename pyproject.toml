@@ -9,13 +9,16 @@ description = "Standalone GPU joint decoding with vLLM"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "vllm>=0.11.0",
+  "vllm<=0.21.0",
   "fsspec",
 ]
 
 [dependency-groups]
-dev = [
+test = [
   "pytest",
+]
+dev = [
+  { include-group = "test" },
 ]
 
 [project.scripts]

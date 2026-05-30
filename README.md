@@ -7,23 +7,12 @@ active request ids to a parent HTTP coordinator. The coordinator chooses one
 token per request. Each worker then masks its logits so vLLM emits that exact
 token. Output text is taken from worker A.
 
-## Install
-
-From this directory:
-
-```bash
-pip install -e .
-```
-
-The project declares `vllm>=0.11.0`. Use the same vLLM version/range that the
-GPU integration test is run against.
-
 ## CLI
 
 We provide a CLI as a simple end-to-end demonstration.
 
 ```bash
-joint-decode-gpu --output completions.jsonl
+uv run joint-decode-gpu --output completions.jsonl
 ```
 
 Important flags:
@@ -99,12 +88,17 @@ HTTP decision coordinator. It forces distinct token streams per request id and
 asserts vLLM outputs by request id. This tests the GPU-specific row-to-request-id
 mapping in `JointDecodeLogitsProcessor`.
 
+Install the project and test dependencies:
+
+```bash
+uv sync
+```
+
 Run it with a local tiny vLLM-compatible model:
 
 ```bash
-JOINT_DECODE_GPU_TEST_MODEL=/path/to/tiny-model \
-PYTHONPATH=src \
-pytest -q tests/test_joint_decode_logits_processor_gpu.py -m gpu
+JOINT_DECODE_GPU_TEST_MODEL="Qwen/Qwen3-0.6B" \
+uv run pytest -q tests/test_joint_decode_logits_processor_gpu.py -m gpu
 ```
 
 Without `JOINT_DECODE_GPU_TEST_MODEL`, the test skips.
