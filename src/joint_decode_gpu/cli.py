@@ -34,6 +34,7 @@ def main() -> None:
             max_model_len=args.max_model_len_a,
             gpu_memory_utilization=args.gpu_memory_utilization_a,
             enable_prefix_caching=args.enable_prefix_caching_a,
+            enforce_eager=not args.compile_a,
         ),
         model_b=JointDecodeModelConfig(
             model_path=args.model_b,
@@ -41,6 +42,7 @@ def main() -> None:
             max_model_len=args.max_model_len_b,
             gpu_memory_utilization=args.gpu_memory_utilization_b,
             enable_prefix_caching=args.enable_prefix_caching_b,
+            enforce_eager=not args.compile_b,
         ),
         sampling=JointDecodeSamplingConfig(
             max_tokens=args.max_tokens,
@@ -82,6 +84,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization-b", type=float, default=0.9)
     parser.add_argument("--enable-prefix-caching-a", action="store_true")
     parser.add_argument("--enable-prefix-caching-b", action="store_true")
+    parser.add_argument("--compile-a", action="store_true")
+    parser.add_argument("--compile-b", action="store_true")
     parser.add_argument("--microbatch-size", type=int, default=8)
     parser.add_argument("--barrier-timeout-s", type=float, default=60.0)
     parser.add_argument("--stop", action="append", default=[])

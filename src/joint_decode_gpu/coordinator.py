@@ -172,6 +172,8 @@ class JointDecoder:
             cmd += ["--gpu-memory-utilization", str(model_config.gpu_memory_utilization)]
         if model_config.enable_prefix_caching:
             cmd.append("--enable-prefix-caching")
+        if model_config.enforce_eager:
+            cmd.append("--enforce-eager")
         if self.config.sampling.stop:
             cmd += ["--stop", json.dumps(list(self.config.sampling.stop))]
 

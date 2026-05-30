@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--gpu-memory-utilization", type=float, default=None)
     parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--stop", default=None)
     args = parser.parse_args()
     run_worker(args)
@@ -46,6 +47,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "tensor_parallel_size": 1,
         "max_model_len": args.max_model_len,
         "enable_prefix_caching": args.enable_prefix_caching,
+        "enforce_eager": args.enforce_eager,
         "logits_processors": [JointDecodeLogitsProcessor],
     }
     if args.gpu_memory_utilization is not None:

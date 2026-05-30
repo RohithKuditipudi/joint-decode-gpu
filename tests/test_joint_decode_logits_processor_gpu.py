@@ -42,6 +42,7 @@ def test_forced_tokens_stay_attached_to_request_ids_under_real_vllm(monkeypatch:
             max_model_len=128,
             max_num_seqs=4,
             logits_processors=[JointDecodeLogitsProcessor],
+            enforce_eager=True,
         )
         tokenizer = llm.get_tokenizer()
         eos_id = int(tokenizer.eos_token_id)
