@@ -15,6 +15,8 @@ from vllm.v1.sample.logits_processor.interface import (
     MoveDirectionality,
 )
 
+from joint_decode_gpu.runtime_state import runtime_state
+
 
 @dataclass
 class RequestState:
@@ -24,15 +26,17 @@ class RequestState:
 
 class JointDecodeLogitsProcessor(LogitsProcessor):
     def __init__(self, vllm_config: Any, device: torch.device, is_pin_memory: bool) -> None:
-        del vllm_config, is_pin_memory
+        del is_pin_memory
         self.device = device
         self.decision_url = _required_env("RERANK_TOKEN_DECISION_URL")
+        self.side = _required_env("RERANK_TOKEN_DECISION_SIDE")
         self.top_k = int(_required_env("RERANK_TOKEN_DECISION_TOP_K"))
         self.timeout = float(_required_env("RERANK_TOKEN_DECISION_TIMEOUT"))
         if self.top_k < 1:
             raise ValueError("RERANK_TOKEN_DECISION_TOP_K must be >= 1")
         if self.timeout <= 0:
             raise ValueError("RERANK_TOKEN_DECISION_TIMEOUT must be > 0")
+        self.eos_token_id = _eos_token_id(vllm_config)
         self._rows: dict[int, RequestState] = {}
         self._batch_size = 0
 
@@ -84,44 +88,93 @@ class JointDecodeLogitsProcessor(LogitsProcessor):
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if logits.ndim != 2:
             raise ValueError(f"expected 2D logits tensor, got shape={tuple(logits.shape)}")
-        request_ids: list[str] = []
-        step_indices: dict[str, int] = {}
+        forced_by_rid: dict[str, int] = {}
+        decode_rows: list[tuple[int, RequestState]] = []
         topk_payload: dict[str, list[dict[str, int | float]]] = {}
         k = min(self.top_k, logits.shape[-1])
-        top_values, top_indices = torch.topk(logits, k=k, dim=-1)
-        top_values_cpu = top_values.detach().cpu()
-        top_indices_cpu = top_indices.detach().cpu()
 
         for row in range(logits.shape[0]):
             state = self._rows.get(row)
             if state is None:
                 raise RuntimeError(f"missing request state for logits row {row}")
-            request_ids.append(state.rid)
-            step_indices[state.rid] = len(state.output_token_ids)
-            topk_payload[state.rid] = [
-                {
-                    "token_id": int(token_id),
-                    "logit": float(logit),
-                }
-                for token_id, logit in zip(top_indices_cpu[row].tolist(), top_values_cpu[row].tolist(), strict=True)
-            ]
+            pending = runtime_state.pending_tokens.get(state.rid)
+            if pending:
+                forced_by_rid[state.rid] = pending.pop(0)
+                if not pending:
+                    runtime_state.pending_tokens.pop(state.rid, None)
+            else:
+                decode_rows.append((row, state))
 
-        response = self._post_decision(
-            {
-                "request_ids": request_ids,
-                "step_indices": step_indices,
-                "topk": topk_payload,
-            }
-        )
-        tokens = response["tokens"]
+        if decode_rows:
+            top_values, top_indices = torch.topk(logits, k=k, dim=-1)
+            top_values_cpu = top_values.detach().cpu()
+            top_indices_cpu = top_indices.detach().cpu()
+            request_ids = [state.rid for _, state in decode_rows]
+            for row, state in decode_rows:
+                topk_payload[state.rid] = [
+                    {
+                        "token_id": int(token_id),
+                        "logit": float(logit),
+                    }
+                    for token_id, logit in zip(
+                        top_indices_cpu[row].tolist(),
+                        top_values_cpu[row].tolist(),
+                        strict=True,
+                    )
+                ]
+
+            response = self._post_decision(
+                {
+                    "kind": "decode",
+                    "side": self.side,
+                    "request_ids": request_ids,
+                    "topk": topk_payload,
+                }
+            )
+            self._apply_response(response, forced_by_rid, {state.rid for _, state in decode_rows})
+
         forced = torch.tensor(
-            [int(tokens[rid]) for rid in request_ids],
+            [forced_by_rid[self._rows[row].rid] for row in range(logits.shape[0])],
             dtype=torch.long,
             device=logits.device,
         ).unsqueeze(-1)
         out = torch.full_like(logits, -float("inf"))
         out.scatter_(-1, forced, 0.0)
         return out
+
+    def _apply_response(
+        self,
+        response: dict[str, Any],
+        forced_by_rid: dict[str, int],
+        decoded_rids: set[str],
+    ) -> None:
+        abort = response.get("abort")
+        if abort:
+            runtime_state.publish_commands(abort=str(abort))
+            raise RuntimeError(str(abort))
+        runtime_state.publish_commands(admit=response.get("admit") or [])
+
+        for rid, token_list in (response.get("tokens") or {}).items():
+            if isinstance(token_list, int):
+                tokens = [token_list]
+            else:
+                tokens = list(token_list)
+            if not tokens:
+                raise RuntimeError(f"coordinator returned an empty token list for rid={rid}")
+            forced_by_rid[rid] = int(tokens.pop(0))
+            if tokens:
+                runtime_state.pending_tokens[rid] = [int(token) for token in tokens]
+            else:
+                runtime_state.pending_tokens.pop(rid, None)
+
+        for rid in response.get("force_stop") or []:
+            if rid in decoded_rids:
+                forced_by_rid[rid] = self.eos_token_id
+                runtime_state.pending_tokens.pop(rid, None)
+
+        missing = decoded_rids - set(forced_by_rid)
+        if missing:
+            raise RuntimeError(f"coordinator did not return tokens or force_stop for rids={sorted(missing)}")
 
     def _post_decision(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode()
@@ -143,3 +196,14 @@ def _required_env(name: str) -> str:
     if value is None:
         raise RuntimeError(f"{name} must be set")
     return value
+
+
+def _eos_token_id(vllm_config: Any) -> int:
+    eos_token_id = vllm_config.model_config.hf_config.eos_token_id
+    if isinstance(eos_token_id, list):
+        if not eos_token_id:
+            raise RuntimeError("model EOS token list must not be empty")
+        eos_token_id = eos_token_id[0]
+    if eos_token_id is None:
+        raise RuntimeError("model config must define eos_token_id")
+    return int(eos_token_id)

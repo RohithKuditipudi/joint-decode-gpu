@@ -7,7 +7,10 @@ import random
 import subprocess
 import sys
 import threading
+from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass, field
+from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -16,55 +19,267 @@ from joint_decode_gpu.ipc import read_ipc
 
 logger = logging.getLogger(__name__)
 
-SelectToken = Callable[..., int]
+SelectTokens = Callable[..., int | tuple[list[int], list[int]]]
+
+
+class Side(StrEnum):
+    A = "a"
+    B = "b"
+
+    def peer(self) -> "Side":
+        return Side.B if self is Side.A else Side.A
+
+
+@dataclass
+class RequestState:
+    rid: str
+    index: int
+    done: set[Side] = field(default_factory=set)
+    decision_count: int = 0
+
+
+@dataclass
+class PendingEntry:
+    side: Side
+    event: threading.Event = field(default_factory=threading.Event)
+    response: dict[str, Any] | None = None
+    error: Exception | None = None
+
+    def resolve(self, response: dict[str, Any]) -> None:
+        self.response = response
+        self.event.set()
+
+    def fail(self, error: Exception) -> None:
+        self.error = error
+        self.event.set()
+
+
+@dataclass
+class DecodeEntry(PendingEntry):
+    request_ids: list[str] = field(default_factory=list)
+    topk: dict[str, list[dict[str, int | float]]] = field(default_factory=dict)
+
+
+def is_retired(state: RequestState) -> bool:
+    return state.done == {Side.A, Side.B}
+
+
+def needs_force_stop(state: RequestState, side: Side) -> bool:
+    return side.peer() in state.done and side not in state.done
 
 
 class Coordinator:
-    def __init__(self, timeout_s: float, select_token: SelectToken, rng: random.Random) -> None:
+    def __init__(
+        self,
+        timeout_s: float,
+        select_tokens: SelectTokens,
+        rng: random.Random,
+        *,
+        max_joint_decisions: int,
+    ) -> None:
         self._timeout_s = timeout_s
-        self._select_token = select_token
+        self._select_tokens = select_tokens
         self._rng = rng
         self._lock = threading.Lock()
-        self._barriers: dict[bytes, dict[str, Any]] = {}
+        self._pending_decode: dict[Side, DecodeEntry] = {}
+        self._requests: dict[str, RequestState] = {}
+        self._queue: deque[str] = deque()
+        self._live: set[str] = set()
+        self._max_concurrent = 0
+        self._max_joint_decisions = max_joint_decisions
+        self._eos_token_ids: dict[Side, int] = {}
+        self._abort: str | None = None
+
+    def set_eos_token_ids(self, *, a: int, b: int) -> None:
+        with self._lock:
+            self._eos_token_ids = {Side.A: a, Side.B: b}
+
+    def begin_run(self, request_ids: list[str], max_concurrent: int) -> list[str]:
+        with self._lock:
+            self._fail_pending(RuntimeError("starting new run while requests are pending"))
+            self._pending_decode.clear()
+            self._requests = {
+                rid: RequestState(rid=rid, index=index)
+                for index, rid in enumerate(request_ids)
+            }
+            self._queue = deque(request_ids)
+            self._live.clear()
+            self._max_concurrent = max_concurrent
+            self._abort = None
+            initial = self._pop_admits(max_concurrent)
+            self._live.update(initial)
+            return initial
 
     def handle(self, side: str, payload: dict[str, Any]) -> dict[str, Any]:
-        request_ids = list(payload["request_ids"])
-        step_indices = payload["step_indices"]
-        topk = payload.get("topk") or {}
-        key = json.dumps(sorted((rid, step_indices[rid]) for rid in request_ids)).encode()
+        request_side = Side(side)
+        payload_side = payload.get("side")
+        if payload_side is not None and payload_side != request_side.value:
+            raise ValueError(f"payload side {payload_side!r} does not match path side {request_side.value!r}")
+        kind = payload.get("kind", "decode")
+        if kind == "decode":
+            return self.handle_decode(request_side, payload)
+        if kind == "finish":
+            return self.handle_finish(request_side, payload)
+        raise ValueError(f"unknown joint-decode request kind: {kind!r}")
 
+    def handle_decode(self, side: Side, payload: dict[str, Any]) -> dict[str, Any]:
+        entry = DecodeEntry(
+            side=side,
+            request_ids=list(payload["request_ids"]),
+            topk=payload.get("topk") or {},
+        )
         with self._lock:
-            entry = self._barriers.get(key)
-            if entry is None:
-                entry = {
-                    "a": None,
-                    "b": None,
-                    "ready": threading.Event(),
-                    "result": None,
-                    "request_ids": request_ids,
-                }
-                self._barriers[key] = entry
-            entry[side] = topk
+            self._ensure_live(entry.request_ids)
+            self._store_pending(self._pending_decode, entry)
+            self._try_resolve_or_abort()
+        return self._wait(entry)
 
-            if entry["a"] is not None and entry["b"] is not None:
-                tokens: dict[str, int] = {}
-                for rid in entry["request_ids"]:
-                    tokens[rid] = self._select_token(
-                        entry["a"].get(rid, []),
-                        entry["b"].get(rid, []),
-                        rng=self._rng,
-                    )
-                entry["result"] = {"tokens": tokens}
-                entry["ready"].set()
-
-        if not entry["ready"].wait(timeout=self._timeout_s):
-            raise TimeoutError(f"joint-decode barrier timed out for request_ids={request_ids}")
-
+    def handle_finish(self, side: Side, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            self._barriers.pop(key, None)
+            for item in payload.get("finished", []):
+                rid = str(item["rid"])
+                state = self._requests[rid]
+                state.done.add(side)
+                if is_retired(state):
+                    self._live.discard(rid)
+            self._try_resolve_or_abort()
+        return {"ok": True}
 
-        assert entry["result"] is not None
-        return entry["result"]
+    def _store_pending(self, pending: dict[Side, PendingEntry], entry: PendingEntry) -> None:
+        if entry.side in pending:
+            raise RuntimeError(f"side {entry.side.value} already has a pending request")
+        pending[entry.side] = entry
+
+    def _wait(self, entry: PendingEntry) -> dict[str, Any]:
+        if not entry.event.wait(timeout=self._timeout_s):
+            with self._lock:
+                self._pending_decode.pop(entry.side, None)
+            raise TimeoutError(f"joint-decode coordinator timed out waiting for side={entry.side.value}")
+        if entry.error is not None:
+            raise entry.error
+        assert entry.response is not None
+        return entry.response
+
+    def _try_resolve(self) -> None:
+        if self._abort is not None:
+            self._fail_pending(RuntimeError(self._abort))
+            return
+        decode_a = self._pending_decode.get(Side.A)
+        decode_b = self._pending_decode.get(Side.B)
+        if decode_a is not None and decode_b is not None:
+            self._resolve_decode_pair(decode_a, decode_b)
+            return
+
+        for side, entry in tuple(self._pending_decode.items()):
+            if self._can_force_stop_all(entry.request_ids, side):
+                self._pending_decode.pop(side, None)
+                entry.resolve(self._decode_response(force_stop=entry.request_ids))
+                return
+
+    def _try_resolve_or_abort(self) -> None:
+        try:
+            self._try_resolve()
+        except Exception as exc:
+            self._abort_all(exc)
+            raise
+
+    def _resolve_decode_pair(self, entry_a: DecodeEntry, entry_b: DecodeEntry) -> None:
+        sa = set(entry_a.request_ids)
+        sb = set(entry_b.request_ids)
+        shared = sa & sb
+        force_a = [
+            rid
+            for rid in entry_a.request_ids
+            if rid not in sb and needs_force_stop(self._requests[rid], Side.A)
+        ]
+        force_b = [
+            rid
+            for rid in entry_b.request_ids
+            if rid not in sa and needs_force_stop(self._requests[rid], Side.B)
+        ]
+        invalid_a = sa - sb - set(force_a)
+        invalid_b = sb - sa - set(force_b)
+        if invalid_a or invalid_b:
+            self._abort_all(RuntimeError(f"joint-decode desync: only_a={sorted(invalid_a)} only_b={sorted(invalid_b)}"))
+            return
+
+        tokens_a: dict[str, list[int]] = {}
+        tokens_b: dict[str, list[int]] = {}
+        for rid in entry_a.request_ids:
+            if rid not in shared:
+                continue
+            state = self._requests[rid]
+            if state.done:
+                self._abort_all(RuntimeError(f"joint-decode desync: decoded finished request {rid}"))
+                return
+            if state.decision_count >= self._max_joint_decisions:
+                selected_a = [self._eos_token_ids[Side.A]]
+                selected_b = [self._eos_token_ids[Side.B]]
+            else:
+                selected_a, selected_b = self._select_for_rid(rid, entry_a, entry_b)
+                state.decision_count += 1
+            tokens_a[rid] = selected_a
+            tokens_b[rid] = selected_b
+
+        self._pending_decode.pop(Side.A, None)
+        self._pending_decode.pop(Side.B, None)
+        entry_a.resolve(self._decode_response(tokens=tokens_a, force_stop=force_a))
+        entry_b.resolve(self._decode_response(tokens=tokens_b, force_stop=force_b))
+
+    def _select_for_rid(
+        self,
+        rid: str,
+        entry_a: DecodeEntry,
+        entry_b: DecodeEntry,
+    ) -> tuple[list[int], list[int]]:
+        selected = self._select_tokens(
+            entry_a.topk.get(rid, []),
+            entry_b.topk.get(rid, []),
+            rng=self._rng,
+        )
+        if isinstance(selected, int):
+            tokens_a = [selected]
+            tokens_b = [selected]
+        else:
+            tokens_a, tokens_b = selected
+        if not tokens_a or not tokens_b:
+            raise ValueError(f"selector returned an empty token list for rid={rid}")
+        return list(tokens_a), list(tokens_b)
+
+    def _can_force_stop_all(self, request_ids: list[str], side: Side) -> bool:
+        return bool(request_ids) and all(needs_force_stop(self._requests[rid], side) for rid in request_ids)
+
+    def _decode_response(
+        self,
+        *,
+        tokens: dict[str, list[int]] | None = None,
+        force_stop: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "tokens": tokens or {},
+            "force_stop": force_stop or [],
+            "admit": [],
+            "abort": None,
+        }
+
+    def _abort_all(self, error: Exception) -> None:
+        self._abort = str(error)
+        self._fail_pending(error)
+
+    def _fail_pending(self, error: Exception) -> None:
+        for entry in self._pending_decode.values():
+            entry.fail(error)
+
+    def _pop_admits(self, count: int) -> list[str]:
+        admits: list[str] = []
+        while self._queue and len(admits) < count:
+            admits.append(self._queue.popleft())
+        return admits
+
+    def _ensure_live(self, request_ids: list[str]) -> None:
+        missing = [rid for rid in request_ids if rid not in self._live]
+        if missing:
+            raise RuntimeError(f"decode request contains non-live rids: {missing}")
 
 
 class DecisionHandler(BaseHTTPRequestHandler):
@@ -95,7 +310,7 @@ class DecisionHandler(BaseHTTPRequestHandler):
 
 
 class JointDecoder:
-    def __init__(self, config: JointDecodeConfig, *, select_token: SelectToken) -> None:
+    def __init__(self, config: JointDecodeConfig, *, select_token: SelectTokens) -> None:
         self.config = config
         self._select_token = select_token
         self._rng = random.Random(config.sampling.seed)
@@ -111,6 +326,7 @@ class JointDecoder:
             self.config.sampling.barrier_timeout_s,
             self._select_token,
             self._rng,
+            max_joint_decisions=self.config.sampling.max_tokens,
         )
         DecisionHandler.coordinator = self._coordinator
         self._http_server = ThreadingHTTPServer(("127.0.0.1", 0), DecisionHandler)
@@ -132,7 +348,7 @@ class JointDecoder:
             )
             handshake_a = read_ipc(self._proc_a, expect_kind="handshake")
             handshake_b = read_ipc(self._proc_b, expect_kind="handshake")
-            self._validate_handshake(handshake_a, handshake_b)
+            self._set_eos_token_ids(handshake_a, handshake_b)
         except Exception:
             self.__exit__(None, None, None)
             raise
@@ -149,6 +365,7 @@ class JointDecoder:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(model_config.gpu_index)
         env["RERANK_TOKEN_DECISION_URL"] = decision_url
+        env["RERANK_TOKEN_DECISION_SIDE"] = side
         env["RERANK_TOKEN_DECISION_TOP_K"] = str(top_k)
         env["RERANK_TOKEN_DECISION_TIMEOUT"] = str(self.config.sampling.barrier_timeout_s + 10.0)
         for key, value in VLLM_GPU_ENV_VARS.items():
@@ -165,6 +382,10 @@ class JointDecoder:
             str(self.config.sampling.max_tokens),
             "--max-model-len",
             str(model_config.max_model_len),
+            "--max-num-seqs",
+            str(self.config.sampling.microbatch_size),
+            "--max-num-batched-tokens",
+            str(self._max_num_batched_tokens(model_config)),
             "--seed",
             str(self.config.sampling.seed),
         ]
@@ -187,16 +408,26 @@ class JointDecoder:
             bufsize=1,
         )
 
-    @staticmethod
-    def _validate_handshake(handshake_a: dict[str, Any], handshake_b: dict[str, Any]) -> None:
-        if handshake_a["vocab_size"] != handshake_b["vocab_size"]:
-            raise RuntimeError(
-                f"tokenizer vocab size mismatch: A={handshake_a['vocab_size']} B={handshake_b['vocab_size']}"
+    def _max_num_batched_tokens(self, model_config: JointDecodeModelConfig) -> int:
+        configured = self.config.sampling.max_num_batched_tokens
+        required = self.config.sampling.microbatch_size * model_config.max_model_len
+        if configured is None:
+            return required
+        if configured < required:
+            raise ValueError(
+                f"max_num_batched_tokens={configured} is too small for "
+                f"microbatch_size={self.config.sampling.microbatch_size} and "
+                f"max_model_len={model_config.max_model_len}; need at least {required}"
             )
-        if handshake_a["eos_token_id"] != handshake_b["eos_token_id"]:
-            raise RuntimeError(
-                f"EOS token id mismatch: A={handshake_a['eos_token_id']} B={handshake_b['eos_token_id']}"
-            )
+        return configured
+
+    def _set_eos_token_ids(self, handshake_a: dict[str, Any], handshake_b: dict[str, Any]) -> None:
+        eos_a = handshake_a["eos_token_id"]
+        eos_b = handshake_b["eos_token_id"]
+        if eos_a is None or eos_b is None:
+            raise RuntimeError(f"both tokenizers must define EOS: A={eos_a!r} B={eos_b!r}")
+        assert self._coordinator is not None
+        self._coordinator.set_eos_token_ids(a=int(eos_a), b=int(eos_b))
 
     def generate(self, prompts_a: list[str], prompts_b: list[str]) -> list[GenerateOutput]:
         outputs: list[GenerateOutput] = []
@@ -213,12 +444,15 @@ class JointDecoder:
     def _generate_microbatch(self, prompts_a: list[str], prompts_b: list[str]) -> list[GenerateOutput]:
         request_ids = [f"jd-c{self._chunk_seq}-r{i:06d}" for i in range(len(prompts_a))]
         self._chunk_seq += 1
+        assert self._coordinator is not None
+        initial_admit = self._coordinator.begin_run(request_ids, len(request_ids))
         for proc, prompts in ((self._proc_a, prompts_a), (self._proc_b, prompts_b)):
             assert proc is not None and proc.stdin is not None
             command = {
                 "command": "process_chunk",
                 "request_ids": request_ids,
                 "prompts": prompts,
+                "initial_admit": initial_admit,
             }
             proc.stdin.write(json.dumps(command) + "\n")
             proc.stdin.flush()
@@ -293,7 +527,7 @@ def run_joint_decode(
     prompts_a: list[str],
     prompts_b: list[str],
     *,
-    select_token: SelectToken,
+    select_token: SelectTokens,
 ) -> list[GenerateOutput]:
     with JointDecoder(config, select_token=select_token) as decoder:
         return decoder.generate(prompts_a, prompts_b)

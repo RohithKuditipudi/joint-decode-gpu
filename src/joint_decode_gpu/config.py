@@ -19,6 +19,7 @@ class JointDecodeSamplingConfig:
     top_k_a: int
     top_k_b: int
     microbatch_size: int
+    max_num_batched_tokens: int | None
     barrier_timeout_s: float
     seed: int
     stop: tuple[str, ...]
@@ -30,6 +31,8 @@ class JointDecodeSamplingConfig:
             raise ValueError("top_k_a and top_k_b must both be >= 1")
         if self.microbatch_size < 1:
             raise ValueError("microbatch_size must be >= 1")
+        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens < 1:
+            raise ValueError("max_num_batched_tokens must be >= 1")
         if self.barrier_timeout_s <= 0:
             raise ValueError("barrier_timeout_s must be > 0")
 

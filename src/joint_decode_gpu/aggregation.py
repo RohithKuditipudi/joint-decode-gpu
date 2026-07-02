@@ -12,7 +12,7 @@ def select_avg_logits(
     advisor_weight: float,
     temperature: float,
     rng: random.Random,
-) -> int:
+) -> tuple[list[int], list[int]]:
     if not 0.0 <= advisor_weight <= 1.0:
         raise ValueError("advisor_weight must be in [0, 1]")
     if temperature < 0.0:
@@ -28,10 +28,12 @@ def select_avg_logits(
     union = list(set(a_logits) | set(b_logits))
     scores = [w_a * a_logits.get(token_id, a_floor) + w_b * b_logits.get(token_id, b_floor) for token_id in union]
     if temperature == 0.0:
-        return union[scores.index(max(scores))]
+        token = union[scores.index(max(scores))]
+        return [token], [token]
     max_score = max(scores)
     weights = [math.exp((score - max_score) / temperature) for score in scores]
-    return rng.choices(union, weights=weights, k=1)[0]
+    token = rng.choices(union, weights=weights, k=1)[0]
+    return [token], [token]
 
 
 def select_product_of_experts(
@@ -40,7 +42,7 @@ def select_product_of_experts(
     *,
     temperature: float,
     rng: random.Random,
-) -> int:
+) -> tuple[list[int], list[int]]:
     return select_avg_logits(
         a_topk,
         b_topk,

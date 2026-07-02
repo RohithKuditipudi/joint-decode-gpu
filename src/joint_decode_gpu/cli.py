@@ -49,6 +49,7 @@ def main() -> None:
             top_k_a=args.top_k_a,
             top_k_b=args.top_k_b,
             microbatch_size=args.microbatch_size,
+            max_num_batched_tokens=args.max_num_batched_tokens,
             barrier_timeout_s=args.barrier_timeout_s,
             seed=args.seed,
             stop=tuple(args.stop or ()),
@@ -87,6 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-a", action="store_true")
     parser.add_argument("--compile-b", action="store_true")
     parser.add_argument("--microbatch-size", type=int, default=8)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--barrier-timeout-s", type=float, default=60.0)
     parser.add_argument("--stop", action="append", default=[])
     return parser.parse_args()

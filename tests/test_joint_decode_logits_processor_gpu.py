@@ -28,6 +28,7 @@ def test_forced_tokens_stay_attached_to_request_ids_under_real_vllm(monkeypatch:
     thread.start()
     port = httpd.server_address[1]
     monkeypatch.setenv("RERANK_TOKEN_DECISION_URL", f"http://127.0.0.1:{port}/tokens")
+    monkeypatch.setenv("RERANK_TOKEN_DECISION_SIDE", "a")
     monkeypatch.setenv("RERANK_TOKEN_DECISION_TOP_K", "4")
     monkeypatch.setenv("RERANK_TOKEN_DECISION_TIMEOUT", "30")
 
@@ -113,6 +114,8 @@ def _decision_server(
     scripts: dict[str, list[int]],
     calls: list[dict[str, Any]],
 ) -> ThreadingHTTPServer:
+    positions: dict[str, int] = {}
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
@@ -121,8 +124,12 @@ def _decision_server(
             length = int(self.headers.get("Content-Length") or 0)
             payload = json.loads(self.rfile.read(length))
             calls.append(payload)
-            tokens = {rid: scripts[rid][payload["step_indices"][rid]] for rid in payload["request_ids"]}
-            response = json.dumps({"tokens": tokens}).encode()
+            tokens: dict[str, list[int]] = {}
+            for rid in payload["request_ids"]:
+                position = positions.get(rid, 0)
+                tokens[rid] = [scripts[rid][position]]
+                positions[rid] = position + 1
+            response = json.dumps({"tokens": tokens, "force_stop": [], "admit": [], "abort": None}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
