@@ -9,9 +9,12 @@ description = "Standalone GPU joint decoding with vLLM"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "vllm<=0.21.0",
+  "vllm",
   "fsspec",
 ]
+
+[tool.uv.sources]
+vllm = { git = "https://github.com/marin-community/vllm.git", rev = "327a10590a2e72ea6de7a00e52a085856158b828" }
 
 [dependency-groups]
 test = [
