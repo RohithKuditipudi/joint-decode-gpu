@@ -45,7 +45,8 @@ def main() -> None:
             enforce_eager=not args.compile_b,
         ),
         sampling=JointDecodeSamplingConfig(
-            max_tokens=args.max_tokens,
+            max_tokens_a=args.max_tokens_a if args.max_tokens_a is not None else args.max_tokens,
+            max_tokens_b=args.max_tokens_b if args.max_tokens_b is not None else args.max_tokens,
             top_k_a=args.top_k_a,
             top_k_b=args.top_k_b,
             microbatch_size=args.microbatch_size,
@@ -78,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--advisor-weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--max-tokens-a", type=int, default=None)
+    parser.add_argument("--max-tokens-b", type=int, default=None)
     parser.add_argument("--max-model-len-a", type=int, default=2048)
     parser.add_argument("--max-model-len-b", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=0)

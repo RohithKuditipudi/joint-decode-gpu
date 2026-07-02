@@ -28,6 +28,18 @@ class EndToEndSetting:
     cases: tuple[StringCase, ...]
 
 
+@dataclass
+class ScriptedCase:
+    model_a: str
+    model_b: str
+    tokenizer_a: Any
+    tokenizer_b: Any
+    prompts_a: list[str]
+    prompts_b: list[str]
+    scripts_a: dict[str, list[list[int]]]
+    scripts_b: dict[str, list[list[int]]]
+
+
 SETTINGS = (
     EndToEndSetting(
         name="two_chunks_microbatch_two",
@@ -112,6 +124,8 @@ def test_two_tokenizer_forced_string_chunks_end_to_end(
         prompts_b = [case.prompt_b for case in setting.cases]
         scripts_a = _scripts_by_rid(tokenizer_a, [case.chunks_a for case in setting.cases])
         scripts_b = _scripts_by_rid(tokenizer_b, [case.chunks_b for case in setting.cases])
+        _append_eos(scripts_a, tokenizer_a)
+        _append_eos(scripts_b, tokenizer_b)
         expected_text = [
             _decode_chunks(tokenizer_a, case_chunks)
             for case_chunks in [case.chunks_a for case in setting.cases]
@@ -131,7 +145,6 @@ def test_two_tokenizer_forced_string_chunks_end_to_end(
 
         monkeypatch.setattr(Coordinator, "_select_for_rid", scripted_select_for_rid)
 
-        max_chunks = max(len(chunks) for chunks in scripts_a.values())
         config = JointDecodeConfig(
             model_a=JointDecodeModelConfig(
                 model_path=model_a,
@@ -150,7 +163,8 @@ def test_two_tokenizer_forced_string_chunks_end_to_end(
                 enforce_eager=True,
             ),
             sampling=JointDecodeSamplingConfig(
-                max_tokens=max_chunks,
+                max_tokens_a=max(len(_flatten_steps(chunks)) for chunks in scripts_a.values()),
+                max_tokens_b=max(len(_flatten_steps(chunks)) for chunks in scripts_b.values()),
                 top_k_a=setting.top_k_a,
                 top_k_b=setting.top_k_b,
                 microbatch_size=setting.microbatch_size,
@@ -178,6 +192,195 @@ def test_two_tokenizer_forced_string_chunks_end_to_end(
     assert positions == {rid: len(chunks) for rid, chunks in scripts_a.items()}
 
 
+@pytest.mark.gpu
+def test_a_side_max_tokens_returns_expected_a_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    case = _scripted_case()
+    expected_a = {
+        rid: _decode_token_prefix(case.tokenizer_a, steps, 3)
+        for rid, steps in case.scripts_a.items()
+    }
+
+    outputs = _run_scripted_case(
+        monkeypatch,
+        case,
+        max_tokens_a=3,
+        max_tokens_b=16,
+        stop=(),
+    )
+
+    assert [output.text for output in outputs] == _ordered_expected(expected_a, outputs)
+
+
+@pytest.mark.gpu
+def test_b_side_max_tokens_force_stops_a(monkeypatch: pytest.MonkeyPatch) -> None:
+    case = _scripted_case()
+    expected_a = {
+        rid: _decode_token_prefix(case.tokenizer_a, case.scripts_a[rid], 3)
+        for rid in case.scripts_a
+    }
+
+    outputs = _run_scripted_case(
+        monkeypatch,
+        case,
+        max_tokens_a=16,
+        max_tokens_b=3,
+        stop=(),
+    )
+
+    assert [output.text for output in outputs] == _ordered_expected(expected_a, outputs)
+
+
+@pytest.mark.gpu
+def test_a_side_stop_string_returns_expected_a_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    case = _scripted_case()
+    stop = "STOP"
+    case.scripts_a = {
+        rid: _token_steps(case.tokenizer_a, f" red blue {stop} green yellow {index}")
+        for index, rid in enumerate(case.scripts_a)
+    }
+    expected_a = {
+        rid: _decode_until_stop(case.tokenizer_a, steps, stop)
+        for rid, steps in case.scripts_a.items()
+    }
+
+    outputs = _run_scripted_case(
+        monkeypatch,
+        case,
+        max_tokens_a=16,
+        max_tokens_b=16,
+        stop=(stop,),
+    )
+
+    assert [output.text for output in outputs] == _ordered_expected(expected_a, outputs)
+
+
+@pytest.mark.gpu
+def test_b_side_stop_string_force_stops_a(monkeypatch: pytest.MonkeyPatch) -> None:
+    case = _scripted_case()
+    stop = "STOP"
+    case.scripts_b = {
+        rid: _token_steps(case.tokenizer_b, f" uno dos {stop} cuatro cinco {index}")
+        for index, rid in enumerate(case.scripts_b)
+    }
+    expected_a = {
+        rid: _decode_token_prefix(
+            case.tokenizer_a,
+            case.scripts_a[rid],
+            _first_stop_step(case.tokenizer_b, case.scripts_b[rid], stop),
+        )
+        for rid in case.scripts_a
+    }
+
+    outputs = _run_scripted_case(
+        monkeypatch,
+        case,
+        max_tokens_a=16,
+        max_tokens_b=16,
+        stop=(stop,),
+    )
+
+    assert [output.text for output in outputs] == _ordered_expected(expected_a, outputs)
+
+
+def _scripted_case() -> ScriptedCase:
+    model_a = _required_env_or_skip("JOINT_DECODE_GPU_TEST_MODEL_A")
+    model_b = _required_env_or_skip("JOINT_DECODE_GPU_TEST_MODEL_B")
+
+    from transformers import AutoTokenizer
+
+    tokenizer_a = AutoTokenizer.from_pretrained(model_a, trust_remote_code=True)
+    tokenizer_b = AutoTokenizer.from_pretrained(model_b, trust_remote_code=True)
+    if tokenizer_a.get_vocab() == tokenizer_b.get_vocab():
+        pytest.skip("test requires two models with different tokenizers")
+
+    prompts_a = [f"A stop case {index}:" for index in range(5)]
+    prompts_b = [f"B stop case {index}:" for index in range(5)]
+    scripts_a = {
+        f"jd-r{index:06d}": _token_steps(tokenizer_a, f" red blue green yellow purple orange {index}")
+        for index in range(len(prompts_a))
+    }
+    scripts_b = {
+        f"jd-r{index:06d}": _token_steps(tokenizer_b, f" uno dos tres cuatro cinco seis {index}")
+        for index in range(len(prompts_b))
+    }
+    return ScriptedCase(
+        model_a=model_a,
+        model_b=model_b,
+        tokenizer_a=tokenizer_a,
+        tokenizer_b=tokenizer_b,
+        prompts_a=prompts_a,
+        prompts_b=prompts_b,
+        scripts_a=scripts_a,
+        scripts_b=scripts_b,
+    )
+
+
+def _run_scripted_case(
+    monkeypatch: pytest.MonkeyPatch,
+    case: ScriptedCase,
+    *,
+    max_tokens_a: int,
+    max_tokens_b: int,
+    stop: tuple[str, ...],
+) -> list[Any]:
+    positions = {rid: 0 for rid in case.scripts_a}
+
+    def scripted_select_for_rid(
+        self: Coordinator,
+        rid: str,
+        entry_a: object,
+        entry_b: object,
+    ) -> tuple[list[int], list[int]]:
+        del self, entry_a, entry_b
+        position = positions[rid]
+        positions[rid] = position + 1
+        return case.scripts_a[rid][position], case.scripts_b[rid][position]
+
+    monkeypatch.setattr(Coordinator, "_select_for_rid", scripted_select_for_rid)
+
+    config = JointDecodeConfig(
+        model_a=JointDecodeModelConfig(
+            model_path=case.model_a,
+            gpu_index=0,
+            max_model_len=128,
+            gpu_memory_utilization=0.8,
+            enable_prefix_caching=False,
+            enforce_eager=True,
+        ),
+        model_b=JointDecodeModelConfig(
+            model_path=case.model_b,
+            gpu_index=1,
+            max_model_len=128,
+            gpu_memory_utilization=0.8,
+            enable_prefix_caching=False,
+            enforce_eager=True,
+        ),
+        sampling=JointDecodeSamplingConfig(
+            max_tokens_a=max_tokens_a,
+            max_tokens_b=max_tokens_b,
+            top_k_a=3,
+            top_k_b=3,
+            microbatch_size=2,
+            max_num_batched_tokens=None,
+            barrier_timeout_s=60.0,
+            seed=0,
+            stop=stop,
+        ),
+    )
+    try:
+        return run_joint_decode(config, case.prompts_a, case.prompts_b, select_token=lambda *_args, **_kwargs: 0)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _ordered_expected(expected_by_rid: dict[str, str], outputs: list[Any]) -> list[str]:
+    return [
+        expected_by_rid[f"jd-r{index:06d}"]
+        for index in range(len(outputs))
+    ]
+
+
 def _required_env_or_skip(name: str) -> str:
     import os
 
@@ -198,6 +401,14 @@ def _scripts_by_rid(
     return scripts
 
 
+def _append_eos(scripts: dict[str, list[list[int]]], tokenizer: Any) -> None:
+    eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        raise ValueError("test tokenizer must define eos_token_id")
+    for script in scripts.values():
+        script.append([int(eos_id)])
+
+
 def _encode_nonempty(tokenizer: Any, text: str) -> list[int]:
     token_ids = [int(token_id) for token_id in tokenizer.encode(text, add_special_tokens=False)]
     if not token_ids:
@@ -212,3 +423,34 @@ def _decode_chunks(tokenizer: Any, chunks: tuple[str, ...]) -> str:
         for token_id in tokenizer.encode(chunk, add_special_tokens=False)
     ]
     return tokenizer.decode(token_ids, skip_special_tokens=True)
+
+
+def _token_steps(tokenizer: Any, text: str) -> list[list[int]]:
+    token_ids = [int(token_id) for token_id in tokenizer.encode(text, add_special_tokens=False)]
+    if not token_ids:
+        raise ValueError(f"text tokenized to an empty list: {text!r}")
+    return [[token_id] for token_id in token_ids]
+
+
+def _decode_token_prefix(tokenizer: Any, steps: list[list[int]], count: int) -> str:
+    return tokenizer.decode(_flatten_steps(steps)[:count], skip_special_tokens=True)
+
+
+def _decode_until_stop(tokenizer: Any, steps: list[list[int]], stop: str) -> str:
+    decoded = tokenizer.decode(_flatten_steps(steps), skip_special_tokens=True)
+    if stop not in decoded:
+        raise ValueError(f"stop string {stop!r} not present in decoded text {decoded!r}")
+    return decoded.split(stop, maxsplit=1)[0]
+
+
+def _first_stop_step(tokenizer: Any, steps: list[list[int]], stop: str) -> int:
+    token_ids: list[int] = []
+    for index, step in enumerate(steps, start=1):
+        token_ids.extend(step)
+        if stop in tokenizer.decode(token_ids, skip_special_tokens=True):
+            return index
+    raise ValueError(f"stop string {stop!r} not produced by scripted tokens")
+
+
+def _flatten_steps(steps: list[list[int]]) -> list[int]:
+    return [token_id for step in steps for token_id in step]

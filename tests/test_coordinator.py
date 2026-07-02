@@ -47,25 +47,6 @@ def test_finish_wakes_peer_decode_with_force_stop() -> None:
     assert future.result()["force_stop"] == ["r0"]
 
 
-def test_joint_limit_returns_side_local_eos_for_shared_decode() -> None:
-    coordinator = _coordinator(lambda *_args, **_kwargs: ([11], [22]), max_joint_decisions=1)
-    coordinator.begin_run(["r0"], 1)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        future_a = pool.submit(coordinator.handle, "a", _decode("a", ["r0"]))
-        future_b = pool.submit(coordinator.handle, "b", _decode("b", ["r0"]))
-
-    assert future_a.result()["tokens"] == {"r0": [11]}
-    assert future_b.result()["tokens"] == {"r0": [22]}
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        future_a = pool.submit(coordinator.handle, "a", _decode("a", ["r0"]))
-        future_b = pool.submit(coordinator.handle, "b", _decode("b", ["r0"]))
-
-    assert future_a.result()["tokens"] == {"r0": [101]}
-    assert future_b.result()["tokens"] == {"r0": [202]}
-
-
 def test_begin_run_resets_run_state() -> None:
     coordinator = _coordinator(lambda *_args, **_kwargs: ([11], [22]))
     assert coordinator.begin_run(["r0", "r1"], 2) == ["r0", "r1"]
@@ -168,15 +149,12 @@ def test_control_decode_aborts_when_decode_side_still_needs_peer_logits() -> Non
         future_decode.result()
 
 
-def _coordinator(selector, *, max_joint_decisions: int = 10) -> Coordinator:
-    coordinator = Coordinator(
+def _coordinator(selector) -> Coordinator:
+    return Coordinator(
         timeout_s=1.0,
         select_tokens=selector,
         rng=random.Random(0),
-        max_joint_decisions=max_joint_decisions,
     )
-    coordinator.set_eos_token_ids(a=101, b=202)
-    return coordinator
 
 
 def _decode(side: str, request_ids: list[str]) -> dict[str, object]:

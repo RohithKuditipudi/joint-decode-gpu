@@ -74,7 +74,8 @@ def run_worker(args: argparse.Namespace) -> None:
     llm = LLM(**kwargs)
     tokenizer = llm.get_tokenizer()
     eos_id = tokenizer.eos_token_id
-    emit_ipc({"kind": "handshake", "vocab_size": len(tokenizer), "eos_token_id": eos_id})
+    emit_ipc({"kind": "handshake"})
+    stop = list(json.loads(args.stop)) if args.stop is not None else None
 
     engine = llm.llm_engine
     _validate_engine(engine, args.max_num_seqs, args.max_num_batched_tokens)
@@ -94,22 +95,39 @@ def run_worker(args: argparse.Namespace) -> None:
         prompts: list[str] = message["prompts"]
         initial_admit: list[str] = message.get("initial_admit") or request_ids
         prompts_by_rid = dict(zip(request_ids, prompts, strict=True))
-        _validate_prompt_lengths(tokenizer, prompts, args.max_model_len)
 
         live: set[str] = set()
         pending_admits: list[str] = []
         text_results: dict[str, str] = {}
         finish_reasons: dict[str, str] = {}
         timeout = float(os.environ["RERANK_TOKEN_DECISION_TIMEOUT"])
-        _admit_requests(engine, tokenizer, prompts_by_rid, initial_admit, live, eos_id, args.max_model_len)
+
+        def admit(rids: list[str]) -> None:
+            for rid in rids:
+                if rid in live:
+                    raise RuntimeError(f"coordinator admitted already-live rid={rid}")
+                engine.add_request(
+                    request_id=rid,
+                    prompt=prompts_by_rid[rid],
+                    params=SamplingParams(
+                        max_tokens=args.max_tokens,
+                        ignore_eos=False,
+                        stop=stop,
+                        stop_token_ids=[eos_id] if eos_id is not None else None,
+                        extra_args={"joint_decode_rid": rid},
+                    ),
+                )
+                live.add(rid)
+
+        admit(initial_admit)
 
         run_done = False
         while not run_done:
-            _stash_admits(_drain_worker_commands(), pending_admits)
+            pending_admits.extend(_drain_worker_commands().admit)
             if pending_admits and _local_decision_boundary(live):
                 admits = pending_admits
                 pending_admits = []
-                _admit_requests(engine, tokenizer, prompts_by_rid, admits, live, eos_id, args.max_model_len)
+                admit(admits)
 
             if not live:
                 response = _post_decision(
@@ -157,7 +175,7 @@ def run_worker(args: argparse.Namespace) -> None:
                     },
                     timeout=timeout,
                 )
-            _stash_admits(_drain_worker_commands(), pending_admits)
+            pending_admits.extend(_drain_worker_commands().admit)
 
         emit_ipc(
             {
@@ -175,35 +193,8 @@ def _drain_worker_commands() -> WorkerCommands:
     return commands
 
 
-def _stash_admits(commands: WorkerCommands, pending_admits: list[str]) -> None:
-    pending_admits.extend(commands.admit)
-
-
 def _local_decision_boundary(live: set[str]) -> bool:
     return not any(runtime_state.pending_tokens.get(rid) for rid in live)
-
-
-def _admit_requests(
-    engine: Any,
-    tokenizer: Any,
-    prompts_by_rid: dict[str, str],
-    request_ids: list[str],
-    live: set[str],
-    eos_id: int | None,
-    max_model_len: int,
-) -> None:
-    for rid in request_ids:
-        if rid in live:
-            continue
-        prompt = prompts_by_rid[rid]
-        sampling_params = SamplingParams(
-            max_tokens=_local_max_tokens(tokenizer, prompt, max_model_len),
-            ignore_eos=False,
-            stop_token_ids=[eos_id] if eos_id is not None else None,
-            extra_args={"joint_decode_rid": rid},
-        )
-        engine.add_request(request_id=rid, prompt=prompt, params=sampling_params)
-        live.add(rid)
 
 
 def _set_held_request_ids(engine: Any, live: set[str]) -> None:
@@ -254,25 +245,6 @@ def _validate_engine(engine: Any, max_num_seqs: int, max_num_batched_tokens: int
         raise RuntimeError(
             f"vLLM max_num_scheduled_tokens={scheduled_tokens} is below max_num_batched_tokens={max_num_batched_tokens}"
         )
-
-
-def _validate_prompt_lengths(tokenizer: Any, prompts: list[str], max_model_len: int) -> None:
-    for prompt in prompts:
-        prompt_len = _prompt_len(tokenizer, prompt)
-        if prompt_len + 1 > max_model_len:
-            raise ValueError(
-                f"prompt length {prompt_len} leaves no room for a generated token under max_model_len={max_model_len}"
-            )
-
-
-def _local_max_tokens(tokenizer: Any, prompt: str, max_model_len: int) -> int:
-    return max_model_len - _prompt_len(tokenizer, prompt)
-
-
-def _prompt_len(tokenizer: Any, prompt: str) -> int:
-    tokenized = tokenizer(prompt)
-    prompt_tokens = tokenized["input_ids"] if isinstance(tokenized, dict) else tokenized.input_ids
-    return len(prompt_tokens)
 
 
 def _post_decision(url: str, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:

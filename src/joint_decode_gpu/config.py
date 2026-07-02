@@ -15,7 +15,8 @@ class JointDecodeModelConfig:
 
 @dataclass(frozen=True)
 class JointDecodeSamplingConfig:
-    max_tokens: int
+    max_tokens_a: int
+    max_tokens_b: int
     top_k_a: int
     top_k_b: int
     microbatch_size: int
@@ -25,8 +26,10 @@ class JointDecodeSamplingConfig:
     stop: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if self.max_tokens < 1:
-            raise ValueError("max_tokens must be >= 1")
+        if self.max_tokens_a < 1:
+            raise ValueError("max_tokens_a must be >= 1")
+        if self.max_tokens_b < 1:
+            raise ValueError("max_tokens_b must be >= 1")
         if self.top_k_a < 1 or self.top_k_b < 1:
             raise ValueError("top_k_a and top_k_b must both be >= 1")
         if self.microbatch_size < 1:

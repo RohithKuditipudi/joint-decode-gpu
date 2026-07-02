@@ -35,7 +35,6 @@ class RequestState:
     rid: str
     index: int
     done: set[Side] = field(default_factory=set)
-    decision_count: int = 0
 
 
 @dataclass
@@ -79,8 +78,6 @@ class Coordinator:
         timeout_s: float,
         select_tokens: SelectTokens,
         rng: random.Random,
-        *,
-        max_joint_decisions: int,
     ) -> None:
         self._timeout_s = timeout_s
         self._select_tokens = select_tokens
@@ -92,13 +89,7 @@ class Coordinator:
         self._queue: deque[str] = deque()
         self._live: set[str] = set()
         self._max_concurrent = 0
-        self._max_joint_decisions = max_joint_decisions
-        self._eos_token_ids: dict[Side, int] = {}
         self._abort: str | None = None
-
-    def set_eos_token_ids(self, *, a: int, b: int) -> None:
-        with self._lock:
-            self._eos_token_ids = {Side.A: a, Side.B: b}
 
     def begin_run(self, request_ids: list[str], max_concurrent: int) -> list[str]:
         with self._lock:
@@ -246,12 +237,7 @@ class Coordinator:
             if state.done:
                 self._abort_all(RuntimeError(f"joint-decode desync: decoded finished request {rid}"))
                 return
-            if state.decision_count >= self._max_joint_decisions:
-                selected_a = [self._eos_token_ids[Side.A]]
-                selected_b = [self._eos_token_ids[Side.B]]
-            else:
-                selected_a, selected_b = self._select_for_rid(rid, entry_a, entry_b)
-                state.decision_count += 1
+            selected_a, selected_b = self._select_for_rid(rid, entry_a, entry_b)
             tokens_a[rid] = selected_a
             tokens_b[rid] = selected_b
 
@@ -432,7 +418,6 @@ class JointDecoder:
             self.config.sampling.barrier_timeout_s,
             self._select_token,
             self._rng,
-            max_joint_decisions=self.config.sampling.max_tokens,
         )
         DecisionHandler.coordinator = self._coordinator
         self._http_server = ThreadingHTTPServer(("127.0.0.1", 0), DecisionHandler)
@@ -444,17 +429,18 @@ class JointDecoder:
                 side="a",
                 model_config=self.config.model_a,
                 top_k=self.config.sampling.top_k_a,
+                max_tokens=self.config.sampling.max_tokens_a,
                 decision_url=f"http://127.0.0.1:{actual_port}/a",
             )
             self._proc_b = self._spawn_worker(
                 side="b",
                 model_config=self.config.model_b,
                 top_k=self.config.sampling.top_k_b,
+                max_tokens=self.config.sampling.max_tokens_b,
                 decision_url=f"http://127.0.0.1:{actual_port}/b",
             )
-            handshake_a = read_ipc(self._proc_a, expect_kind="handshake")
-            handshake_b = read_ipc(self._proc_b, expect_kind="handshake")
-            self._set_eos_token_ids(handshake_a, handshake_b)
+            read_ipc(self._proc_a, expect_kind="handshake")
+            read_ipc(self._proc_b, expect_kind="handshake")
         except Exception:
             self.__exit__(None, None, None)
             raise
@@ -466,6 +452,7 @@ class JointDecoder:
         side: str,
         model_config: JointDecodeModelConfig,
         top_k: int,
+        max_tokens: int,
         decision_url: str,
     ) -> subprocess.Popen:
         env = os.environ.copy()
@@ -485,7 +472,7 @@ class JointDecoder:
             "--model-path",
             model_config.model_path,
             "--max-tokens",
-            str(self.config.sampling.max_tokens),
+            str(max_tokens),
             "--max-model-len",
             str(model_config.max_model_len),
             "--max-num-seqs",
@@ -526,14 +513,6 @@ class JointDecoder:
                 f"max_model_len={model_config.max_model_len}; need at least {required}"
             )
         return configured
-
-    def _set_eos_token_ids(self, handshake_a: dict[str, Any], handshake_b: dict[str, Any]) -> None:
-        eos_a = handshake_a["eos_token_id"]
-        eos_b = handshake_b["eos_token_id"]
-        if eos_a is None or eos_b is None:
-            raise RuntimeError(f"both tokenizers must define EOS: A={eos_a!r} B={eos_b!r}")
-        assert self._coordinator is not None
-        self._coordinator.set_eos_token_ids(a=int(eos_a), b=int(eos_b))
 
     def generate(self, prompts_a: list[str], prompts_b: list[str]) -> list[GenerateOutput]:
         if len(prompts_a) != len(prompts_b):

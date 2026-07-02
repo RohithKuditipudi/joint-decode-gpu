@@ -1,11 +1,12 @@
 # joint-decode-gpu
 
-Standalone GPU joint decoding for two vLLM models that share a tokenizer.
+Standalone GPU joint decoding for two vLLM models, including models with
+different tokenizers.
 
 At each decode step, worker A and worker B each send top-k logits for the same
 active request ids to a parent HTTP coordinator. The coordinator chooses one
-token per request. Each worker then masks its logits so vLLM emits that exact
-token. Output text is taken from worker A.
+side-local token list per request. Each worker then masks its logits so vLLM emits
+the chosen local token. Output text is taken from worker A.
 
 ## CLI
 
@@ -17,8 +18,7 @@ uv run joint-decode-gpu --output completions.jsonl
 
 Important flags:
 
-- `--model-a`, `--model-b`: model paths or HF ids. Tokenizer vocab size and EOS
-  id must match.
+- `--model-a`, `--model-b`: model paths or HF ids. Tokenizers may differ.
 - `--gpu-a`, `--gpu-b`: physical GPU ids. The parent sets
   `CUDA_VISIBLE_DEVICES` separately for each worker.
 - `--top-k-a`, `--top-k-b`: top-k payload size each worker sends to the
@@ -26,14 +26,14 @@ Important flags:
 - `--advisor-weight`: weight on model B in the default average-logits rule.
   Model A weight is `1 - advisor_weight`.
 - `--temperature`: joint sampling temperature used by the coordinator.
-- `--microbatch-size`: number of prompts sent to both workers at a time.
-  (small enough so that both engines can process all prompts together;
-  otherwise will cause a stall due to scheduler divergence)
+- `--microbatch-size`: maximum number of live requests in the synchronized
+  sliding window.
+- `--max-tokens`: shared side-local vLLM generation cap.
+- `--max-tokens-a`, `--max-tokens-b`: optional side-specific generation caps.
 - `--prompts`: path to JSONL file.
   Each row must contain `id`, `prompt_a`, and `prompt_b` —
   `prompt_a` is fed to model A, `prompt_b` to model B. They can differ (e.g.
-  different chat templates or system prompts) while the two models share one
-  forced continuation:
+  different chat templates or system prompts):
 
   ```json
   {"id": "p0", "prompt_a": "Write a short proof that...", "prompt_b": "Write a short proof that..."}
@@ -46,7 +46,7 @@ The CLI writes JSONL, one row per input row in input order:
 {"id": "p0", "prompt_a": "...", "prompt_b": "...", "completion": "...", "finish_reason": "..."}
 ```
 
-`completion` is the shared forced continuation, detokenized by model A.
+`completion` is the model-A continuation.
 
 ## Custom Aggregation
 
@@ -54,7 +54,8 @@ The CLI uses average-logits aggregation. Experiments can bypass the CLI and call
 `run_joint_decode` directly with their own token selector. A selector can be
 an arbitrary function that takes two lists of tokens and associated logits
 (i.e., the top-k tokens from each model) as well as an RNG instance and returns
-a selected token. For example:
+side-local token lists. Returning a single `int` is supported only as a shorthand
+for forcing the same token id on both sides. For example:
 
 ```python
 import random
@@ -68,7 +69,7 @@ def select_dumb(
     *,
     rng: random.Random,
 ):
-  return a_topk[0]["token_id"]
+  return [a_topk[0]["token_id"]], [b_topk[0]["token_id"]]
 
 outputs = run_joint_decode(
     config,
