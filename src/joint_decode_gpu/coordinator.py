@@ -60,6 +60,11 @@ class DecodeEntry(PendingEntry):
     topk: dict[str, list[dict[str, int | float]]] = field(default_factory=dict)
 
 
+@dataclass
+class ControlEntry(PendingEntry):
+    pass
+
+
 def is_retired(state: RequestState) -> bool:
     return state.done == {Side.A, Side.B}
 
@@ -82,6 +87,7 @@ class Coordinator:
         self._rng = rng
         self._lock = threading.Lock()
         self._pending_decode: dict[Side, DecodeEntry] = {}
+        self._pending_control: dict[Side, ControlEntry] = {}
         self._requests: dict[str, RequestState] = {}
         self._queue: deque[str] = deque()
         self._live: set[str] = set()
@@ -98,6 +104,7 @@ class Coordinator:
         with self._lock:
             self._fail_pending(RuntimeError("starting new run while requests are pending"))
             self._pending_decode.clear()
+            self._pending_control.clear()
             self._requests = {
                 rid: RequestState(rid=rid, index=index)
                 for index, rid in enumerate(request_ids)
@@ -120,6 +127,8 @@ class Coordinator:
             return self.handle_decode(request_side, payload)
         if kind == "finish":
             return self.handle_finish(request_side, payload)
+        if kind == "control":
+            return self.handle_control(request_side, payload)
         raise ValueError(f"unknown joint-decode request kind: {kind!r}")
 
     def handle_decode(self, side: Side, payload: dict[str, Any]) -> dict[str, Any]:
@@ -131,6 +140,14 @@ class Coordinator:
         with self._lock:
             self._ensure_live(entry.request_ids)
             self._store_pending(self._pending_decode, entry)
+            self._try_resolve_or_abort()
+        return self._wait(entry)
+
+    def handle_control(self, side: Side, payload: dict[str, Any]) -> dict[str, Any]:
+        del payload
+        entry = ControlEntry(side=side)
+        with self._lock:
+            self._store_pending(self._pending_control, entry)
             self._try_resolve_or_abort()
         return self._wait(entry)
 
@@ -154,6 +171,7 @@ class Coordinator:
         if not entry.event.wait(timeout=self._timeout_s):
             with self._lock:
                 self._pending_decode.pop(entry.side, None)
+                self._pending_control.pop(entry.side, None)
             raise TimeoutError(f"joint-decode coordinator timed out waiting for side={entry.side.value}")
         if entry.error is not None:
             raise entry.error
@@ -166,8 +184,19 @@ class Coordinator:
             return
         decode_a = self._pending_decode.get(Side.A)
         decode_b = self._pending_decode.get(Side.B)
+        control_a = self._pending_control.get(Side.A)
+        control_b = self._pending_control.get(Side.B)
         if decode_a is not None and decode_b is not None:
             self._resolve_decode_pair(decode_a, decode_b)
+            return
+        if control_a is not None and control_b is not None:
+            self._resolve_control_pair(control_a, control_b)
+            return
+        if control_a is not None and decode_b is not None:
+            self._resolve_control_decode(control_a, decode_b)
+            return
+        if decode_a is not None and control_b is not None:
+            self._resolve_control_decode(control_b, decode_a)
             return
 
         for side, entry in tuple(self._pending_decode.items()):
@@ -175,6 +204,11 @@ class Coordinator:
                 self._pending_decode.pop(side, None)
                 entry.resolve(self._decode_response(force_stop=entry.request_ids))
                 return
+
+        if self._is_done():
+            for side, entry in tuple(self._pending_control.items()):
+                self._pending_control.pop(side, None)
+                entry.resolve(self._control_response(done=True))
 
     def _try_resolve_or_abort(self) -> None:
         try:
@@ -223,8 +257,45 @@ class Coordinator:
 
         self._pending_decode.pop(Side.A, None)
         self._pending_decode.pop(Side.B, None)
-        entry_a.resolve(self._decode_response(tokens=tokens_a, force_stop=force_a))
-        entry_b.resolve(self._decode_response(tokens=tokens_b, force_stop=force_b))
+        admit = []
+        if self._can_admit_from_decode_response(tokens_a, tokens_b, force_a, force_b):
+            admit = self._admit_available()
+        entry_a.resolve(self._decode_response(tokens=tokens_a, force_stop=force_a, admit=admit))
+        entry_b.resolve(self._decode_response(tokens=tokens_b, force_stop=force_b, admit=admit))
+
+    def _resolve_control_pair(self, entry_a: ControlEntry, entry_b: ControlEntry) -> None:
+        if self._is_done():
+            self._pending_control.pop(Side.A, None)
+            self._pending_control.pop(Side.B, None)
+            entry_a.resolve(self._control_response(done=True))
+            entry_b.resolve(self._control_response(done=True))
+            return
+
+        admit = self._admit_available()
+        if admit:
+            self._pending_control.pop(Side.A, None)
+            self._pending_control.pop(Side.B, None)
+            entry_a.resolve(self._control_response(admit=admit))
+            entry_b.resolve(self._control_response(admit=admit))
+            return
+
+        self._abort_all(RuntimeError("joint-decode desync: both workers idle before run completion"))
+
+    def _resolve_control_decode(self, control_entry: ControlEntry, decode_entry: DecodeEntry) -> None:
+        if not self._can_force_stop_all(decode_entry.request_ids, decode_entry.side):
+            self._abort_all(
+                RuntimeError(
+                    "joint-decode desync: one worker is idle while peer still needs logits "
+                    f"for rids={decode_entry.request_ids}"
+                )
+            )
+            return
+
+        self._pending_decode.pop(decode_entry.side, None)
+        decode_entry.resolve(self._decode_response(force_stop=decode_entry.request_ids))
+        if self._is_done():
+            self._pending_control.pop(control_entry.side, None)
+            control_entry.resolve(self._control_response(done=True))
 
     def _select_for_rid(
         self,
@@ -254,12 +325,20 @@ class Coordinator:
         *,
         tokens: dict[str, list[int]] | None = None,
         force_stop: list[str] | None = None,
+        admit: list[str] | None = None,
     ) -> dict[str, Any]:
         return {
             "tokens": tokens or {},
             "force_stop": force_stop or [],
-            "admit": [],
+            "admit": admit or [],
             "abort": None,
+        }
+
+    def _control_response(self, *, admit: list[str] | None = None, done: bool = False) -> dict[str, Any]:
+        return {
+            "admit": admit or [],
+            "abort": None,
+            "done": done,
         }
 
     def _abort_all(self, error: Exception) -> None:
@@ -269,6 +348,34 @@ class Coordinator:
     def _fail_pending(self, error: Exception) -> None:
         for entry in self._pending_decode.values():
             entry.fail(error)
+        for entry in self._pending_control.values():
+            entry.fail(error)
+
+    def _is_done(self) -> bool:
+        return not self._queue and not self._live
+
+    def _can_admit_from_decode_response(
+        self,
+        tokens_a: dict[str, list[int]],
+        tokens_b: dict[str, list[int]],
+        force_a: list[str],
+        force_b: list[str],
+    ) -> bool:
+        if not self._queue or len(self._live) >= self._max_concurrent:
+            return False
+        if any(len(tokens) != 1 for tokens in tokens_a.values()):
+            return False
+        if any(len(tokens) != 1 for tokens in tokens_b.values()):
+            return False
+        return bool(tokens_a or tokens_b or force_a or force_b)
+
+    def _admit_available(self) -> list[str]:
+        count = self._max_concurrent - len(self._live)
+        if count <= 0:
+            return []
+        admit = self._pop_admits(count)
+        self._live.update(admit)
+        return admit
 
     def _pop_admits(self, count: int) -> list[str]:
         admits: list[str] = []
@@ -319,7 +426,6 @@ class JointDecoder:
         self._http_thread: threading.Thread | None = None
         self._proc_a: subprocess.Popen | None = None
         self._proc_b: subprocess.Popen | None = None
-        self._chunk_seq = 0
 
     def __enter__(self) -> JointDecoder:
         self._coordinator = Coordinator(
@@ -430,22 +536,14 @@ class JointDecoder:
         self._coordinator.set_eos_token_ids(a=int(eos_a), b=int(eos_b))
 
     def generate(self, prompts_a: list[str], prompts_b: list[str]) -> list[GenerateOutput]:
-        outputs: list[GenerateOutput] = []
-        microbatch_size = self.config.sampling.microbatch_size
-        for start in range(0, len(prompts_a), microbatch_size):
-            outputs.extend(
-                self._generate_microbatch(
-                    prompts_a[start : start + microbatch_size],
-                    prompts_b[start : start + microbatch_size],
-                )
-            )
-        return outputs
+        if len(prompts_a) != len(prompts_b):
+            raise ValueError(f"prompt count mismatch: A={len(prompts_a)} B={len(prompts_b)}")
+        return self._generate_run(prompts_a, prompts_b)
 
-    def _generate_microbatch(self, prompts_a: list[str], prompts_b: list[str]) -> list[GenerateOutput]:
-        request_ids = [f"jd-c{self._chunk_seq}-r{i:06d}" for i in range(len(prompts_a))]
-        self._chunk_seq += 1
+    def _generate_run(self, prompts_a: list[str], prompts_b: list[str]) -> list[GenerateOutput]:
+        request_ids = [f"jd-r{i:06d}" for i in range(len(prompts_a))]
         assert self._coordinator is not None
-        initial_admit = self._coordinator.begin_run(request_ids, len(request_ids))
+        initial_admit = self._coordinator.begin_run(request_ids, self.config.sampling.microbatch_size)
         for proc, prompts in ((self._proc_a, prompts_a), (self._proc_b, prompts_b)):
             assert proc is not None and proc.stdin is not None
             command = {

@@ -7,8 +7,10 @@ import pytest
 from joint_decode_gpu.runtime_state import runtime_state
 from joint_decode_gpu.worker import (
     _drain_worker_commands,
+    _local_decision_boundary,
     _post_decision,
     _set_held_request_ids,
+    _stash_admits,
     _validate_prompt_lengths,
 )
 
@@ -20,6 +22,25 @@ def test_worker_drains_runtime_abort_command() -> None:
     with pytest.raises(RuntimeError, match="boom"):
         _drain_worker_commands()
     assert runtime_state.latest_commands is None
+
+
+def test_worker_stashes_runtime_admit_command() -> None:
+    runtime_state.reset()
+    runtime_state.publish_commands(admit=["r1", "r2"])
+
+    pending_admits: list[str] = []
+    _stash_admits(_drain_worker_commands(), pending_admits)
+
+    assert pending_admits == ["r1", "r2"]
+    assert runtime_state.latest_commands is None
+
+
+def test_local_decision_boundary_requires_no_live_pending_tokens() -> None:
+    runtime_state.reset()
+    runtime_state.pending_tokens["r0"] = [7]
+
+    assert not _local_decision_boundary({"r0", "r1"})
+    assert _local_decision_boundary({"r1"})
 
 
 def test_compute_holds_skips_prefill_and_holds_empty_decode_rows() -> None:

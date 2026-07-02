@@ -13,7 +13,7 @@ import torch.distributed as dist
 
 from joint_decode_gpu.config import VLLM_GPU_ENV_VARS
 from joint_decode_gpu.ipc import emit_ipc
-from joint_decode_gpu.runtime_state import runtime_state
+from joint_decode_gpu.runtime_state import WorkerCommands, runtime_state
 
 logger = logging.getLogger(__name__)
 
@@ -94,22 +94,40 @@ def run_worker(args: argparse.Namespace) -> None:
         prompts: list[str] = message["prompts"]
         initial_admit: list[str] = message.get("initial_admit") or request_ids
         prompts_by_rid = dict(zip(request_ids, prompts, strict=True))
-        _validate_prompt_lengths(tokenizer, [prompts_by_rid[rid] for rid in initial_admit], args.max_model_len)
-        for rid in initial_admit:
-            prompt = prompts_by_rid[rid]
-            sampling_params = SamplingParams(
-                max_tokens=_local_max_tokens(tokenizer, prompt, args.max_model_len),
-                ignore_eos=False,
-                stop_token_ids=[eos_id] if eos_id is not None else None,
-                extra_args={"joint_decode_rid": rid},
-            )
-            engine.add_request(request_id=rid, prompt=prompt, params=sampling_params)
+        _validate_prompt_lengths(tokenizer, prompts, args.max_model_len)
 
-        live = set(initial_admit)
+        live: set[str] = set()
+        pending_admits: list[str] = []
         text_results: dict[str, str] = {}
         finish_reasons: dict[str, str] = {}
-        while live:
-            _drain_worker_commands()
+        timeout = float(os.environ["RERANK_TOKEN_DECISION_TIMEOUT"])
+        _admit_requests(engine, tokenizer, prompts_by_rid, initial_admit, live, eos_id, args.max_model_len)
+
+        run_done = False
+        while not run_done:
+            _stash_admits(_drain_worker_commands(), pending_admits)
+            if pending_admits and _local_decision_boundary(live):
+                admits = pending_admits
+                pending_admits = []
+                _admit_requests(engine, tokenizer, prompts_by_rid, admits, live, eos_id, args.max_model_len)
+
+            if not live:
+                response = _post_decision(
+                    decision_url,
+                    {
+                        "kind": "control",
+                        "side": side,
+                    },
+                    timeout=timeout,
+                )
+                if response.get("abort"):
+                    raise RuntimeError(str(response["abort"]))
+                if response.get("done"):
+                    run_done = True
+                    continue
+                pending_admits.extend(str(rid) for rid in response.get("admit") or [])
+                continue
+
             _set_held_request_ids(engine, live)
             finished: list[dict[str, Any]] = []
             for output in engine.step():
@@ -137,9 +155,9 @@ def run_worker(args: argparse.Namespace) -> None:
                         "side": side,
                         "finished": finished,
                     },
-                    timeout=float(os.environ["RERANK_TOKEN_DECISION_TIMEOUT"]),
+                    timeout=timeout,
                 )
-            _drain_worker_commands()
+            _stash_admits(_drain_worker_commands(), pending_admits)
 
         emit_ipc(
             {
@@ -150,10 +168,42 @@ def run_worker(args: argparse.Namespace) -> None:
         )
 
 
-def _drain_worker_commands() -> None:
+def _drain_worker_commands() -> WorkerCommands:
     commands = runtime_state.drain_commands()
     if commands.abort is not None:
         raise RuntimeError(commands.abort)
+    return commands
+
+
+def _stash_admits(commands: WorkerCommands, pending_admits: list[str]) -> None:
+    pending_admits.extend(commands.admit)
+
+
+def _local_decision_boundary(live: set[str]) -> bool:
+    return not any(runtime_state.pending_tokens.get(rid) for rid in live)
+
+
+def _admit_requests(
+    engine: Any,
+    tokenizer: Any,
+    prompts_by_rid: dict[str, str],
+    request_ids: list[str],
+    live: set[str],
+    eos_id: int | None,
+    max_model_len: int,
+) -> None:
+    for rid in request_ids:
+        if rid in live:
+            continue
+        prompt = prompts_by_rid[rid]
+        sampling_params = SamplingParams(
+            max_tokens=_local_max_tokens(tokenizer, prompt, max_model_len),
+            ignore_eos=False,
+            stop_token_ids=[eos_id] if eos_id is not None else None,
+            extra_args={"joint_decode_rid": rid},
+        )
+        engine.add_request(request_id=rid, prompt=prompt, params=sampling_params)
+        live.add(rid)
 
 
 def _set_held_request_ids(engine: Any, live: set[str]) -> None:

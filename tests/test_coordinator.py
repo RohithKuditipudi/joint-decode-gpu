@@ -66,7 +66,7 @@ def test_joint_limit_returns_side_local_eos_for_shared_decode() -> None:
     assert future_b.result()["tokens"] == {"r0": [202]}
 
 
-def test_begin_run_resets_phase1_chunk_state() -> None:
+def test_begin_run_resets_run_state() -> None:
     coordinator = _coordinator(lambda *_args, **_kwargs: ([11], [22]))
     assert coordinator.begin_run(["r0", "r1"], 2) == ["r0", "r1"]
     coordinator.handle("a", {"kind": "finish", "side": "a", "finished": [{"rid": "r0"}, {"rid": "r1"}]})
@@ -79,6 +79,93 @@ def test_begin_run_resets_phase1_chunk_state() -> None:
 
     assert future_a.result()["tokens"] == {"r2": [11]}
     assert future_b.result()["tokens"] == {"r2": [22]}
+
+
+def test_decode_pair_admits_from_derived_capacity_after_retirement() -> None:
+    coordinator = _coordinator(lambda *_args, **_kwargs: ([11], [22]))
+    assert coordinator.begin_run(["r0", "r1", "r2"], 2) == ["r0", "r1"]
+    coordinator.handle("a", {"kind": "finish", "side": "a", "finished": [{"rid": "r0"}]})
+    coordinator.handle("b", {"kind": "finish", "side": "b", "finished": [{"rid": "r0"}]})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(coordinator.handle, "a", _decode("a", ["r1"]))
+        future_b = pool.submit(coordinator.handle, "b", _decode("b", ["r1"]))
+
+    assert future_a.result()["admit"] == ["r2"]
+    assert future_b.result()["admit"] == ["r2"]
+
+
+def test_decode_pair_does_not_admit_with_multi_token_tail() -> None:
+    coordinator = _coordinator(lambda *_args, **_kwargs: ([11, 12], [22]))
+    assert coordinator.begin_run(["r0", "r1", "r2"], 2) == ["r0", "r1"]
+    coordinator.handle("a", {"kind": "finish", "side": "a", "finished": [{"rid": "r0"}]})
+    coordinator.handle("b", {"kind": "finish", "side": "b", "finished": [{"rid": "r0"}]})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(coordinator.handle, "a", _decode("a", ["r1"]))
+        future_b = pool.submit(coordinator.handle, "b", _decode("b", ["r1"]))
+
+    assert future_a.result()["tokens"] == {"r1": [11, 12]}
+    assert future_a.result()["admit"] == []
+    assert future_b.result()["admit"] == []
+
+
+def test_control_pair_admits_when_window_has_capacity() -> None:
+    coordinator = _coordinator(lambda *_args, **_kwargs: ([11], [22]))
+    assert coordinator.begin_run(["r0", "r1"], 1) == ["r0"]
+    coordinator.handle("a", {"kind": "finish", "side": "a", "finished": [{"rid": "r0"}]})
+    coordinator.handle("b", {"kind": "finish", "side": "b", "finished": [{"rid": "r0"}]})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(coordinator.handle, "a", _control("a"))
+        future_b = pool.submit(coordinator.handle, "b", _control("b"))
+
+    assert future_a.result() == {"admit": ["r1"], "abort": None, "done": False}
+    assert future_b.result() == {"admit": ["r1"], "abort": None, "done": False}
+
+
+def test_control_pair_returns_done_at_end() -> None:
+    coordinator = _coordinator(lambda *_args, **_kwargs: ([11], [22]))
+    assert coordinator.begin_run(["r0"], 1) == ["r0"]
+    coordinator.handle("a", {"kind": "finish", "side": "a", "finished": [{"rid": "r0"}]})
+    coordinator.handle("b", {"kind": "finish", "side": "b", "finished": [{"rid": "r0"}]})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(coordinator.handle, "a", _control("a"))
+        future_b = pool.submit(coordinator.handle, "b", _control("b"))
+
+    assert future_a.result()["done"] is True
+    assert future_b.result()["done"] is True
+
+
+def test_control_decode_force_stops_terminal_decode_side() -> None:
+    coordinator = _coordinator(lambda *_args, **_kwargs: ([11], [22]))
+    assert coordinator.begin_run(["r0"], 1) == ["r0"]
+    coordinator.handle("a", {"kind": "finish", "side": "a", "finished": [{"rid": "r0"}]})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_control = pool.submit(coordinator.handle, "a", _control("a"))
+        _wait_for_pending_control(coordinator, Side.A)
+        future_decode = pool.submit(coordinator.handle, "b", _decode("b", ["r0"]))
+        assert future_decode.result()["force_stop"] == ["r0"]
+        coordinator.handle("b", {"kind": "finish", "side": "b", "finished": [{"rid": "r0"}]})
+
+    assert future_control.result()["done"] is True
+
+
+def test_control_decode_aborts_when_decode_side_still_needs_peer_logits() -> None:
+    coordinator = _coordinator(lambda *_args, **_kwargs: ([11], [22]))
+    assert coordinator.begin_run(["r0"], 1) == ["r0"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_control = pool.submit(coordinator.handle, "a", _control("a"))
+        _wait_for_pending_control(coordinator, Side.A)
+        future_decode = pool.submit(coordinator.handle, "b", _decode("b", ["r0"]))
+
+    with pytest.raises(RuntimeError, match="worker is idle"):
+        future_control.result()
+    with pytest.raises(RuntimeError, match="worker is idle"):
+        future_decode.result()
 
 
 def _coordinator(selector, *, max_joint_decisions: int = 10) -> Coordinator:
@@ -101,6 +188,13 @@ def _decode(side: str, request_ids: list[str]) -> dict[str, object]:
     }
 
 
+def _control(side: str) -> dict[str, object]:
+    return {
+        "kind": "control",
+        "side": side,
+    }
+
+
 def _wait_for_pending_decode(coordinator: Coordinator, side: Side) -> None:
     for _ in range(1000):
         with coordinator._lock:
@@ -108,3 +202,12 @@ def _wait_for_pending_decode(coordinator: Coordinator, side: Side) -> None:
                 return
         time.sleep(0.001)
     raise AssertionError(f"side {side.value} did not post a pending decode")
+
+
+def _wait_for_pending_control(coordinator: Coordinator, side: Side) -> None:
+    for _ in range(1000):
+        with coordinator._lock:
+            if side in coordinator._pending_control:
+                return
+        time.sleep(0.001)
+    raise AssertionError(f"side {side.value} did not post a pending control")

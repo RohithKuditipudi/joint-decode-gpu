@@ -110,8 +110,8 @@ def test_two_tokenizer_forced_string_chunks_end_to_end(
 
         prompts_a = [case.prompt_a for case in setting.cases]
         prompts_b = [case.prompt_b for case in setting.cases]
-        scripts_a = _scripts_by_rid(tokenizer_a, [case.chunks_a for case in setting.cases], setting.microbatch_size)
-        scripts_b = _scripts_by_rid(tokenizer_b, [case.chunks_b for case in setting.cases], setting.microbatch_size)
+        scripts_a = _scripts_by_rid(tokenizer_a, [case.chunks_a for case in setting.cases])
+        scripts_b = _scripts_by_rid(tokenizer_b, [case.chunks_b for case in setting.cases])
         expected_text = [
             _decode_chunks(tokenizer_a, case_chunks)
             for case_chunks in [case.chunks_a for case in setting.cases]
@@ -190,13 +190,10 @@ def _required_env_or_skip(name: str) -> str:
 def _scripts_by_rid(
     tokenizer: Any,
     all_chunks: list[tuple[str, ...]],
-    microbatch_size: int,
 ) -> dict[str, list[list[int]]]:
     scripts: dict[str, list[list[int]]] = {}
     for case_index, chunks in enumerate(all_chunks):
-        chunk_index = case_index // microbatch_size
-        index_in_chunk = case_index % microbatch_size
-        rid = f"jd-c{chunk_index}-r{index_in_chunk:06d}"
+        rid = f"jd-r{case_index:06d}"
         scripts[rid] = [_encode_nonempty(tokenizer, chunk) for chunk in chunks]
     return scripts
 
