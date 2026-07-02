@@ -158,10 +158,11 @@ def _drain_worker_commands() -> None:
 
 def _set_held_request_ids(engine: Any, live: set[str]) -> None:
     scheduler = _scheduler(engine)
+    requests = scheduler.requests
     decode_live = {
         rid
         for rid in live
-        if scheduler.requests[rid].num_computed_tokens >= scheduler.requests[rid].num_prompt_tokens
+        if rid in requests and requests[rid].num_computed_tokens >= requests[rid].num_prompt_tokens
     }
     pending_tokens = runtime_state.pending_tokens
     busy = any(pending_tokens.get(rid) for rid in decode_live)
