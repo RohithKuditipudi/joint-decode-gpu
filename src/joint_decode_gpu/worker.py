@@ -158,15 +158,25 @@ def _drain_worker_commands() -> None:
 
 def _set_held_request_ids(engine: Any, live: set[str]) -> None:
     scheduler = _scheduler(engine)
-    requests = scheduler.requests
-    decode_live = {
-        rid
-        for rid in live
-        if rid in requests and requests[rid].num_computed_tokens >= requests[rid].num_prompt_tokens
-    }
     pending_tokens = runtime_state.pending_tokens
+    decode_live: dict[str, str] = {}
+    for internal_id, request in scheduler.requests.items():
+        assert request.sampling_params is not None
+        extra_args = request.sampling_params.extra_args
+        assert extra_args is not None
+        rid = str(extra_args["joint_decode_rid"])
+
+        if rid not in live:
+            continue
+        if request.num_computed_tokens >= request.num_prompt_tokens:
+            decode_live[rid] = internal_id
+
     busy = any(pending_tokens.get(rid) for rid in decode_live)
-    scheduler.held_request_ids = {rid for rid in decode_live if busy and not pending_tokens.get(rid)}
+    scheduler.held_request_ids = {
+        internal_id
+        for rid, internal_id in decode_live.items()
+        if busy and not pending_tokens.get(rid)
+    }
 
 
 def _scheduler(engine: Any) -> Any:

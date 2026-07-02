@@ -27,16 +27,16 @@ def test_compute_holds_skips_prefill_and_holds_empty_decode_rows() -> None:
     runtime_state.pending_tokens["busy"] = [7]
     scheduler = _FakeScheduler(
         requests={
-            "busy": _FakeRequest(num_computed_tokens=5, num_prompt_tokens=5),
-            "empty": _FakeRequest(num_computed_tokens=5, num_prompt_tokens=5),
-            "prefill": _FakeRequest(num_computed_tokens=2, num_prompt_tokens=5),
+            "busy-internal": _FakeRequest("busy", num_computed_tokens=5, num_prompt_tokens=5),
+            "empty-internal": _FakeRequest("empty", num_computed_tokens=5, num_prompt_tokens=5),
+            "prefill-internal": _FakeRequest("prefill", num_computed_tokens=2, num_prompt_tokens=5),
         }
     )
     engine = _FakeEngine(scheduler)
 
     _set_held_request_ids(engine, {"busy", "empty", "prefill"})
 
-    assert scheduler.held_request_ids == {"empty"}
+    assert scheduler.held_request_ids == {"empty-internal"}
 
 
 def test_prompt_length_validation_requires_generation_room() -> None:
@@ -73,8 +73,22 @@ def test_worker_post_uses_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @dataclass
 class _FakeRequest:
+    rid: str
     num_computed_tokens: int
     num_prompt_tokens: int
+
+    @property
+    def sampling_params(self) -> _FakeSamplingParams:
+        return _FakeSamplingParams(self.rid)
+
+
+@dataclass(frozen=True)
+class _FakeSamplingParams:
+    rid: str
+
+    @property
+    def extra_args(self) -> dict[str, str]:
+        return {"joint_decode_rid": self.rid}
 
 
 class _FakeScheduler:
