@@ -65,6 +65,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "enable_chunked_prefill": False,
         "enable_prefix_caching": args.enable_prefix_caching,
         "enforce_eager": args.enforce_eager,
+        "async_scheduling": False,
         "logits_processors": [JointDecodeLogitsProcessor],
     }
     if args.gpu_memory_utilization is not None:
