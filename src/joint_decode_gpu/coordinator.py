@@ -14,7 +14,13 @@ from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from joint_decode_gpu.config import VLLM_GPU_ENV_VARS, GenerateOutput, JointDecodeConfig, JointDecodeModelConfig
+from joint_decode_gpu.config import (
+    ADMISSION_RAMP_PROMPTS,
+    VLLM_GPU_ENV_VARS,
+    GenerateOutput,
+    JointDecodeConfig,
+    JointDecodeModelConfig,
+)
 from joint_decode_gpu.ipc import read_ipc
 
 logger = logging.getLogger(__name__)
@@ -35,6 +41,15 @@ class RequestState:
     rid: str
     index: int
     done: set[Side] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class SidePlan:
+    """Per-side admission inputs for one run: the worker's per-step token budget
+    and each request's prompt length in that side's tokens."""
+
+    budget: int
+    prompt_tokens: dict[str, int]
 
 
 @dataclass
@@ -89,9 +104,17 @@ class Coordinator:
         self._queue: deque[str] = deque()
         self._live: set[str] = set()
         self._max_concurrent = 0
+        self._plan_a = SidePlan(budget=0, prompt_tokens={})
+        self._plan_b = SidePlan(budget=0, prompt_tokens={})
         self._abort: str | None = None
 
-    def begin_run(self, request_ids: list[str], max_concurrent: int) -> list[str]:
+    def begin_run(
+        self,
+        request_ids: list[str],
+        max_concurrent: int,
+        plan_a: SidePlan,
+        plan_b: SidePlan,
+    ) -> list[str]:
         with self._lock:
             self._fail_pending(RuntimeError("starting new run while requests are pending"))
             self._pending_decode.clear()
@@ -103,10 +126,10 @@ class Coordinator:
             self._queue = deque(request_ids)
             self._live.clear()
             self._max_concurrent = max_concurrent
+            self._plan_a = plan_a
+            self._plan_b = plan_b
             self._abort = None
-            initial = self._pop_admits(max_concurrent)
-            self._live.update(initial)
-            return initial
+            return self._admit_available()
 
     def handle(self, side: str, payload: dict[str, Any]) -> dict[str, Any]:
         request_side = Side(side)
@@ -356,17 +379,29 @@ class Coordinator:
         return bool(tokens_a or tokens_b or force_a or force_b)
 
     def _admit_available(self) -> list[str]:
-        count = self._max_concurrent - len(self._live)
-        if count <= 0:
-            return []
-        admit = self._pop_admits(count)
-        self._live.update(admit)
-        return admit
-
-    def _pop_admits(self, count: int) -> list[str]:
         admits: list[str] = []
-        while self._queue and len(admits) < count:
+        tokens_a = tokens_b = 0
+        while self._queue and len(self._live) + len(admits) < self._max_concurrent:
+            rid = self._queue[0]
+            need_a = tokens_a + self._plan_a.prompt_tokens[rid]
+            need_b = tokens_b + self._plan_b.prompt_tokens[rid]
+            # The next scheduler step must fit one decode token per live request
+            # plus the full prompts of every request admitted this round, on
+            # both sides, so the admitted prompts prefill in the same step.
+            if len(self._live) + need_a > self._plan_a.budget:
+                break
+            if len(self._live) + need_b > self._plan_b.budget:
+                break
+            tokens_a, tokens_b = need_a, need_b
             admits.append(self._queue.popleft())
+        self._live.update(admits)
+        if admits:
+            logger.info(
+                "admitted %d requests (live=%d, queued=%d)",
+                len(admits),
+                len(self._live),
+                len(self._queue),
+            )
         return admits
 
     def _ensure_live(self, request_ids: list[str]) -> None:
@@ -402,6 +437,32 @@ class DecisionHandler(BaseHTTPRequestHandler):
             self.send_error(500, str(exc))
 
 
+def _validated_side_plan(
+    payload: dict[str, Any],
+    *,
+    request_ids: list[str],
+    max_model_len: int,
+    budget: int,
+    side: str,
+) -> SidePlan:
+    prompt_tokens = {str(rid): int(count) for rid, count in payload["prompt_tokens"].items()}
+    if set(prompt_tokens) != set(request_ids):
+        raise RuntimeError(f"worker {side} plan request ids do not match the run request ids")
+    for rid, count in prompt_tokens.items():
+        if count < 1:
+            raise RuntimeError(f"worker {side} reported an empty prompt for rid={rid}")
+        if count > max_model_len:
+            raise RuntimeError(
+                f"worker {side} prompt for rid={rid} is {count} tokens, over max_model_len={max_model_len}"
+            )
+        if count > budget:
+            raise RuntimeError(
+                f"worker {side} prompt for rid={rid} is {count} tokens, "
+                f"over max_num_batched_tokens={budget}"
+            )
+    return SidePlan(budget=budget, prompt_tokens=prompt_tokens)
+
+
 class JointDecoder:
     def __init__(self, config: JointDecodeConfig, *, select_token: SelectTokens) -> None:
         self.config = config
@@ -412,6 +473,10 @@ class JointDecoder:
         self._http_thread: threading.Thread | None = None
         self._proc_a: subprocess.Popen | None = None
         self._proc_b: subprocess.Popen | None = None
+        self._max_live_requests_a = 0
+        self._max_live_requests_b = 0
+        self._budget_a = 0
+        self._budget_b = 0
 
     def __enter__(self) -> JointDecoder:
         self._coordinator = Coordinator(
@@ -425,12 +490,16 @@ class JointDecoder:
         self._http_thread = threading.Thread(target=self._http_server.serve_forever, daemon=True)
         self._http_thread.start()
         try:
+            max_num_seqs_a, self._budget_a = self._worker_scheduler_args(self.config.model_a)
+            max_num_seqs_b, self._budget_b = self._worker_scheduler_args(self.config.model_b)
             self._proc_a = self._spawn_worker(
                 side="a",
                 model_config=self.config.model_a,
                 top_k=self.config.sampling.top_k_a,
                 max_tokens=self.config.sampling.max_tokens_a,
                 decision_url=f"http://127.0.0.1:{actual_port}/a",
+                max_num_seqs=max_num_seqs_a,
+                max_num_batched_tokens=self._budget_a,
             )
             self._proc_b = self._spawn_worker(
                 side="b",
@@ -438,9 +507,13 @@ class JointDecoder:
                 top_k=self.config.sampling.top_k_b,
                 max_tokens=self.config.sampling.max_tokens_b,
                 decision_url=f"http://127.0.0.1:{actual_port}/b",
+                max_num_seqs=max_num_seqs_b,
+                max_num_batched_tokens=self._budget_b,
             )
-            read_ipc(self._proc_a, expect_kind="handshake")
-            read_ipc(self._proc_b, expect_kind="handshake")
+            handshake_a = read_ipc(self._proc_a, expect_kind="handshake")
+            handshake_b = read_ipc(self._proc_b, expect_kind="handshake")
+            self._max_live_requests_a = int(handshake_a["max_live_requests"])
+            self._max_live_requests_b = int(handshake_b["max_live_requests"])
         except Exception:
             self.__exit__(None, None, None)
             raise
@@ -454,6 +527,8 @@ class JointDecoder:
         top_k: int,
         max_tokens: int,
         decision_url: str,
+        max_num_seqs: int,
+        max_num_batched_tokens: int,
     ) -> subprocess.Popen:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(model_config.gpu_index)
@@ -476,9 +551,9 @@ class JointDecoder:
             "--max-model-len",
             str(model_config.max_model_len),
             "--max-num-seqs",
-            str(self.config.sampling.microbatch_size),
+            str(max_num_seqs),
             "--max-num-batched-tokens",
-            str(self._max_num_batched_tokens(model_config)),
+            str(max_num_batched_tokens),
             "--seed",
             str(self.config.sampling.seed),
         ]
@@ -501,18 +576,22 @@ class JointDecoder:
             bufsize=1,
         )
 
-    def _max_num_batched_tokens(self, model_config: JointDecodeModelConfig) -> int:
+    def _worker_scheduler_args(self, model_config: JointDecodeModelConfig) -> tuple[int, int]:
+        max_num_seqs = self.config.sampling.max_microbatch_size
         configured = self.config.sampling.max_num_batched_tokens
-        required = self.config.sampling.microbatch_size * model_config.max_model_len
         if configured is None:
-            return required
-        if configured < required:
+            return max_num_seqs, max_num_seqs + ADMISSION_RAMP_PROMPTS * model_config.max_model_len
+        if configured < model_config.max_model_len:
             raise ValueError(
-                f"max_num_batched_tokens={configured} is too small for "
-                f"microbatch_size={self.config.sampling.microbatch_size} and "
-                f"max_model_len={model_config.max_model_len}; need at least {required}"
+                f"max_num_batched_tokens={configured} is smaller than "
+                f"max_model_len={model_config.max_model_len}"
             )
-        return configured
+        if configured < max_num_seqs:
+            raise ValueError(
+                f"max_num_batched_tokens={configured} is smaller than "
+                f"max_num_seqs={max_num_seqs}"
+            )
+        return max_num_seqs, configured
 
     def generate(self, prompts_a: list[str], prompts_b: list[str]) -> list[GenerateOutput]:
         if len(prompts_a) != len(prompts_b):
@@ -522,16 +601,41 @@ class JointDecoder:
     def _generate_run(self, prompts_a: list[str], prompts_b: list[str]) -> list[GenerateOutput]:
         request_ids = [f"jd-r{i:06d}" for i in range(len(prompts_a))]
         assert self._coordinator is not None
-        initial_admit = self._coordinator.begin_run(request_ids, self.config.sampling.microbatch_size)
+        assert self._proc_a is not None and self._proc_b is not None
         for proc, prompts in ((self._proc_a, prompts_a), (self._proc_b, prompts_b)):
-            assert proc is not None and proc.stdin is not None
+            assert proc.stdin is not None
             command = {
                 "command": "process_chunk",
                 "request_ids": request_ids,
                 "prompts": prompts,
-                "initial_admit": initial_admit,
             }
             proc.stdin.write(json.dumps(command) + "\n")
+            proc.stdin.flush()
+
+        plan_a = _validated_side_plan(
+            read_ipc(self._proc_a, expect_kind="plan"),
+            request_ids=request_ids,
+            max_model_len=self.config.model_a.max_model_len,
+            budget=self._budget_a,
+            side="a",
+        )
+        plan_b = _validated_side_plan(
+            read_ipc(self._proc_b, expect_kind="plan"),
+            request_ids=request_ids,
+            max_model_len=self.config.model_b.max_model_len,
+            budget=self._budget_b,
+            side="b",
+        )
+        window = min(
+            len(prompts_a),
+            self.config.sampling.max_microbatch_size,
+            self._max_live_requests_a,
+            self._max_live_requests_b,
+        )
+        initial_admit = self._coordinator.begin_run(request_ids, window, plan_a, plan_b)
+        for proc in (self._proc_a, self._proc_b):
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps({"command": "start", "initial_admit": initial_admit}) + "\n")
             proc.stdin.flush()
 
         results: dict[str, Any] = {}
@@ -542,7 +646,6 @@ class JointDecoder:
             except Exception as exc:
                 results[name] = exc
 
-        assert self._proc_a is not None and self._proc_b is not None
         threads = [
             threading.Thread(target=reader, args=("a", self._proc_a), daemon=True),
             threading.Thread(target=reader, args=("b", self._proc_b), daemon=True),

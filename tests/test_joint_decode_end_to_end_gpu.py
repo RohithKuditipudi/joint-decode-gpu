@@ -7,7 +7,7 @@ import pytest
 import torch.distributed as dist
 
 from joint_decode_gpu.config import JointDecodeConfig, JointDecodeModelConfig, JointDecodeSamplingConfig
-from joint_decode_gpu.coordinator import Coordinator, run_joint_decode
+from joint_decode_gpu.coordinator import Coordinator, JointDecoder, run_joint_decode
 
 
 @dataclass(frozen=True)
@@ -21,7 +21,7 @@ class StringCase:
 @dataclass(frozen=True)
 class EndToEndSetting:
     name: str
-    microbatch_size: int
+    max_microbatch_size: int
     top_k_a: int
     top_k_b: int
     max_num_batched_tokens: int | None
@@ -40,10 +40,12 @@ class ScriptedCase:
     scripts_b: dict[str, list[list[int]]]
 
 
+_RAMP_FILLER = " ".join(f"filler{index}" for index in range(30))
+
 SETTINGS = (
     EndToEndSetting(
         name="two_chunks_microbatch_two",
-        microbatch_size=2,
+        max_microbatch_size=2,
         top_k_a=4,
         top_k_b=5,
         max_num_batched_tokens=None,
@@ -57,7 +59,7 @@ SETTINGS = (
     ),
     EndToEndSetting(
         name="three_chunks_microbatch_three",
-        microbatch_size=3,
+        max_microbatch_size=3,
         top_k_a=3,
         top_k_b=3,
         max_num_batched_tokens=None,
@@ -90,7 +92,7 @@ SETTINGS = (
     ),
     EndToEndSetting(
         name="explicit_batched_tokens",
-        microbatch_size=2,
+        max_microbatch_size=2,
         top_k_a=2,
         top_k_b=2,
         max_num_batched_tokens=256,
@@ -98,6 +100,47 @@ SETTINGS = (
             StringCase("Explicit A0:", (" north wind", " returns"), "Explicit B0:", (" cielo gris", " vuelve")),
             StringCase("Explicit A1:", (" south star", " rises"), "Explicit B1:", (" bosque seco", " duerme")),
             StringCase("Explicit A2:", (" east road", " bends"), "Explicit B2:", (" rio largo", " canta")),
+        ),
+    ),
+    # Long prompts against a budget of one max_model_len force the coordinator
+    # to admit the window over several decision rounds instead of all at once.
+    EndToEndSetting(
+        name="budget_limited_admission_ramp",
+        max_microbatch_size=4,
+        top_k_a=2,
+        top_k_b=2,
+        max_num_batched_tokens=128,
+        cases=(
+            StringCase(
+                f"A ramp 0 {_RAMP_FILLER}:",
+                (" red apple", " on table"),
+                f"B ramp 0 {_RAMP_FILLER}:",
+                (" gato azul", " salta alto"),
+            ),
+            StringCase(
+                f"A ramp 1 {_RAMP_FILLER}:",
+                (" blue stone", " near river"),
+                f"B ramp 1 {_RAMP_FILLER}:",
+                (" perro verde", " corre lejos"),
+            ),
+            StringCase(
+                f"A ramp 2 {_RAMP_FILLER}:",
+                (" gold coin", " under sand"),
+                f"B ramp 2 {_RAMP_FILLER}:",
+                (" luna blanca", " brilla hoy"),
+            ),
+            StringCase(
+                f"A ramp 3 {_RAMP_FILLER}:",
+                (" black bird", " above trees"),
+                f"B ramp 3 {_RAMP_FILLER}:",
+                (" sol rojo", " cae tarde"),
+            ),
+            StringCase(
+                f"A ramp 4 {_RAMP_FILLER}:",
+                (" green leaf", " after rain"),
+                f"B ramp 4 {_RAMP_FILLER}:",
+                (" mar frio", " sube lento"),
+            ),
         ),
     ),
 )
@@ -167,11 +210,11 @@ def test_two_tokenizer_forced_string_chunks_end_to_end(
                 max_tokens_b=max(len(_flatten_steps(chunks)) for chunks in scripts_b.values()),
                 top_k_a=setting.top_k_a,
                 top_k_b=setting.top_k_b,
-                microbatch_size=setting.microbatch_size,
-                max_num_batched_tokens=setting.max_num_batched_tokens,
                 barrier_timeout_s=60.0,
                 seed=0,
                 stop=(),
+                max_microbatch_size=setting.max_microbatch_size,
+                max_num_batched_tokens=setting.max_num_batched_tokens,
             ),
         )
 
@@ -190,6 +233,53 @@ def test_two_tokenizer_forced_string_chunks_end_to_end(
     ]
     assert all(output.finish_reason == "stop" for output in outputs)
     assert positions == {rid: len(chunks) for rid, chunks in scripts_a.items()}
+
+
+@pytest.mark.gpu
+def test_large_window_initialization_smoke() -> None:
+    """A 1024-request cap with the default token budget must initialize.
+
+    The retired full-window budget derivation (max_microbatch_size *
+    max_model_len = 2,097,152 batched tokens) made vLLM fail during startup
+    profiling before the handshake.
+    """
+    model_a = _required_env_or_skip("JOINT_DECODE_GPU_TEST_MODEL_A")
+    model_b = _required_env_or_skip("JOINT_DECODE_GPU_TEST_MODEL_B")
+
+    config = JointDecodeConfig(
+        model_a=JointDecodeModelConfig(
+            model_path=model_a,
+            gpu_index=0,
+            max_model_len=2048,
+            gpu_memory_utilization=0.8,
+            enable_prefix_caching=False,
+            enforce_eager=True,
+        ),
+        model_b=JointDecodeModelConfig(
+            model_path=model_b,
+            gpu_index=1,
+            max_model_len=2048,
+            gpu_memory_utilization=0.8,
+            enable_prefix_caching=False,
+            enforce_eager=True,
+        ),
+        sampling=JointDecodeSamplingConfig(
+            max_tokens_a=8,
+            max_tokens_b=8,
+            top_k_a=2,
+            top_k_b=2,
+            barrier_timeout_s=60.0,
+            seed=0,
+            stop=(),
+        ),
+    )
+    try:
+        with JointDecoder(config, select_token=lambda *_args, **_kwargs: 0) as decoder:
+            assert decoder._max_live_requests_a >= 1
+            assert decoder._max_live_requests_b >= 1
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 @pytest.mark.gpu
@@ -360,11 +450,11 @@ def _run_scripted_case(
             max_tokens_b=max_tokens_b,
             top_k_a=3,
             top_k_b=3,
-            microbatch_size=2,
-            max_num_batched_tokens=None,
             barrier_timeout_s=60.0,
             seed=0,
             stop=stop,
+            max_microbatch_size=2,
+            max_num_batched_tokens=None,
         ),
     )
     try:

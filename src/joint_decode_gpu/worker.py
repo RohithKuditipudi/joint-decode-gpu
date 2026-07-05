@@ -7,6 +7,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import torch.distributed as dist
@@ -48,7 +49,8 @@ def run_worker(args: argparse.Namespace) -> None:
     for key, value in VLLM_GPU_ENV_VARS.items():
         os.environ[key] = value
 
-    from vllm import LLM, SamplingParams
+    from vllm import LLM, SamplingParams, TokensPrompt
+    from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 
     from joint_decode_gpu.logits_processor import JointDecodeLogitsProcessor
 
@@ -74,16 +76,18 @@ def run_worker(args: argparse.Namespace) -> None:
     llm = LLM(**kwargs)
     tokenizer = llm.get_tokenizer()
     eos_id = tokenizer.eos_token_id
-    emit_ipc({"kind": "handshake"})
     stop = list(json.loads(args.stop)) if args.stop is not None else None
 
     engine = llm.llm_engine
     _validate_engine(engine, args.max_num_seqs, args.max_num_batched_tokens)
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        message = json.loads(line)
+    emit_ipc(
+        {
+            "kind": "handshake",
+            "max_live_requests": _max_live_requests(engine, get_max_concurrency_for_kv_cache_config),
+        }
+    )
+    commands = _commands(sys.stdin)
+    for message in commands:
         command = message.get("command")
         if command == "shutdown":
             break
@@ -93,8 +97,17 @@ def run_worker(args: argparse.Namespace) -> None:
         runtime_state.reset()
         request_ids: list[str] = message["request_ids"]
         prompts: list[str] = message["prompts"]
-        initial_admit: list[str] = message.get("initial_admit") or request_ids
-        prompts_by_rid = dict(zip(request_ids, prompts, strict=True))
+        token_ids_by_rid: dict[str, list[int]] = {
+            rid: tokenizer.encode(prompt)
+            for rid, prompt in zip(request_ids, prompts, strict=True)
+        }
+        emit_ipc(
+            {
+                "kind": "plan",
+                "prompt_tokens": {rid: len(token_ids) for rid, token_ids in token_ids_by_rid.items()},
+            }
+        )
+        initial_admit = _read_start(commands)
 
         live: set[str] = set()
         pending_admits: list[str] = []
@@ -108,7 +121,7 @@ def run_worker(args: argparse.Namespace) -> None:
                     raise RuntimeError(f"coordinator admitted already-live rid={rid}")
                 engine.add_request(
                     request_id=rid,
-                    prompt=prompts_by_rid[rid],
+                    prompt=TokensPrompt(prompt_token_ids=token_ids_by_rid[rid]),
                     params=SamplingParams(
                         max_tokens=args.max_tokens,
                         ignore_eos=False,
@@ -186,6 +199,21 @@ def run_worker(args: argparse.Namespace) -> None:
         )
 
 
+def _commands(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        yield json.loads(line)
+
+
+def _read_start(commands: Iterator[dict[str, Any]]) -> list[str]:
+    start = next(commands, None)
+    if start is None or start.get("command") != "start":
+        raise RuntimeError(f"expected start command after plan, got {start!r}")
+    return [str(rid) for rid in start["initial_admit"]]
+
+
 def _drain_worker_commands() -> WorkerCommands:
     commands = runtime_state.drain_commands()
     if commands.abort is not None:
@@ -229,6 +257,15 @@ def _scheduler(engine: Any) -> Any:
     return scheduler
 
 
+def _max_live_requests(engine: Any, concurrency_fn: Any) -> int:
+    """Largest live window that can never exhaust KV cache, per vLLM's own
+    max-model-len concurrency accounting. Staying under it means vLLM never
+    preempts, which is what keeps the two engines' decode sets identical."""
+    scheduler = _scheduler(engine)
+    max_concurrency = concurrency_fn(engine.vllm_config, scheduler.kv_cache_config)
+    return min(int(max_concurrency), scheduler.scheduler_config.max_num_seqs)
+
+
 def _validate_engine(engine: Any, max_num_seqs: int, max_num_batched_tokens: int) -> None:
     scheduler = _scheduler(engine)
     if not hasattr(scheduler, "held_request_ids"):
@@ -236,6 +273,10 @@ def _validate_engine(engine: Any, max_num_seqs: int, max_num_batched_tokens: int
     scheduler_config = scheduler.scheduler_config
     if scheduler_config.async_scheduling is not False:
         raise RuntimeError("joint decode requires async_scheduling=False")
+    if scheduler_config.enable_chunked_prefill is not False:
+        raise RuntimeError("joint decode requires enable_chunked_prefill=False")
+    if scheduler_config.long_prefill_token_threshold != 0:
+        raise RuntimeError("joint decode requires long_prefill_token_threshold=0")
     if scheduler_config.max_num_seqs != max_num_seqs:
         raise RuntimeError(
             f"vLLM max_num_seqs mismatch: scheduler={scheduler_config.max_num_seqs} expected={max_num_seqs}"
