@@ -8,7 +8,12 @@ import logging
 import fsspec
 
 from joint_decode_gpu.aggregation import select_avg_logits
-from joint_decode_gpu.config import JointDecodeConfig, JointDecodeModelConfig, JointDecodeSamplingConfig
+from joint_decode_gpu.config import (
+    DEFAULT_MAX_MICROBATCH_SIZE,
+    JointDecodeConfig,
+    JointDecodeModelConfig,
+    JointDecodeSamplingConfig,
+)
 from joint_decode_gpu.coordinator import run_joint_decode
 
 logger = logging.getLogger(__name__)
@@ -49,11 +54,11 @@ def main() -> None:
             max_tokens_b=args.max_tokens_b if args.max_tokens_b is not None else args.max_tokens,
             top_k_a=args.top_k_a,
             top_k_b=args.top_k_b,
-            microbatch_size=args.microbatch_size,
             max_num_batched_tokens=args.max_num_batched_tokens,
             barrier_timeout_s=args.barrier_timeout_s,
             seed=args.seed,
             stop=tuple(args.stop or ()),
+            max_microbatch_size=args.max_microbatch_size,
         ),
     )
     select_token = functools.partial(
@@ -90,7 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-prefix-caching-b", action="store_true")
     parser.add_argument("--compile-a", action="store_true")
     parser.add_argument("--compile-b", action="store_true")
-    parser.add_argument("--microbatch-size", type=int, default=8)
+    parser.add_argument("--max-microbatch-size", type=int, default=DEFAULT_MAX_MICROBATCH_SIZE)
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--barrier-timeout-s", type=float, default=60.0)
     parser.add_argument("--stop", action="append", default=[])

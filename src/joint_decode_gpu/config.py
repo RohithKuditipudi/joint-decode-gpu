@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+DEFAULT_MAX_MICROBATCH_SIZE = 1024
+
+
 @dataclass(frozen=True)
 class JointDecodeModelConfig:
     model_path: str
@@ -19,11 +22,11 @@ class JointDecodeSamplingConfig:
     max_tokens_b: int
     top_k_a: int
     top_k_b: int
-    microbatch_size: int
-    max_num_batched_tokens: int | None
     barrier_timeout_s: float
     seed: int
     stop: tuple[str, ...]
+    max_microbatch_size: int = DEFAULT_MAX_MICROBATCH_SIZE
+    max_num_batched_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_tokens_a < 1:
@@ -32,8 +35,8 @@ class JointDecodeSamplingConfig:
             raise ValueError("max_tokens_b must be >= 1")
         if self.top_k_a < 1 or self.top_k_b < 1:
             raise ValueError("top_k_a and top_k_b must both be >= 1")
-        if self.microbatch_size < 1:
-            raise ValueError("microbatch_size must be >= 1")
+        if self.max_microbatch_size < 1:
+            raise ValueError("max_microbatch_size must be >= 1")
         if self.max_num_batched_tokens is not None and self.max_num_batched_tokens < 1:
             raise ValueError("max_num_batched_tokens must be >= 1")
         if self.barrier_timeout_s <= 0:
