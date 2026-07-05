@@ -44,12 +44,12 @@ class RequestState:
 
 
 @dataclass(frozen=True)
-class SidePlan:
-    """Per-side admission inputs for one run: the worker's per-step token budget
-    and each request's prompt length in that side's tokens."""
+class SideLimits:
+    """Per-side admission bounds: the worker's per-step token budget and the
+    prompt-length upper bound vLLM enforces at add_request."""
 
-    budget: int
-    prompt_tokens: dict[str, int]
+    max_num_batched_tokens: int
+    max_model_len: int
 
 
 @dataclass
@@ -104,16 +104,16 @@ class Coordinator:
         self._queue: deque[str] = deque()
         self._live: set[str] = set()
         self._max_concurrent = 0
-        self._plan_a = SidePlan(budget=0, prompt_tokens={})
-        self._plan_b = SidePlan(budget=0, prompt_tokens={})
+        self._limits_a = SideLimits(max_num_batched_tokens=0, max_model_len=1)
+        self._limits_b = SideLimits(max_num_batched_tokens=0, max_model_len=1)
         self._abort: str | None = None
 
     def begin_run(
         self,
         request_ids: list[str],
         max_concurrent: int,
-        plan_a: SidePlan,
-        plan_b: SidePlan,
+        limits_a: SideLimits,
+        limits_b: SideLimits,
     ) -> list[str]:
         with self._lock:
             self._fail_pending(RuntimeError("starting new run while requests are pending"))
@@ -126,8 +126,8 @@ class Coordinator:
             self._queue = deque(request_ids)
             self._live.clear()
             self._max_concurrent = max_concurrent
-            self._plan_a = plan_a
-            self._plan_b = plan_b
+            self._limits_a = limits_a
+            self._limits_b = limits_b
             self._abort = None
             return self._admit_available()
 
@@ -379,29 +379,26 @@ class Coordinator:
         return bool(tokens_a or tokens_b or force_a or force_b)
 
     def _admit_available(self) -> list[str]:
-        admits: list[str] = []
-        tokens_a = tokens_b = 0
-        while self._queue and len(self._live) + len(admits) < self._max_concurrent:
-            rid = self._queue[0]
-            need_a = tokens_a + self._plan_a.prompt_tokens[rid]
-            need_b = tokens_b + self._plan_b.prompt_tokens[rid]
-            # The next scheduler step must fit one decode token per live request
-            # plus the full prompts of every request admitted this round, on
-            # both sides, so the admitted prompts prefill in the same step.
-            if len(self._live) + need_a > self._plan_a.budget:
-                break
-            if len(self._live) + need_b > self._plan_b.budget:
-                break
-            tokens_a, tokens_b = need_a, need_b
-            admits.append(self._queue.popleft())
+        live = len(self._live)
+        # The next scheduler step must fit one decode token per live request
+        # plus up to max_model_len prompt tokens per admitted request, on both
+        # sides, so the admitted prompts prefill in the same step.
+        count = min(
+            self._max_concurrent - live,
+            (self._limits_a.max_num_batched_tokens - live) // self._limits_a.max_model_len,
+            (self._limits_b.max_num_batched_tokens - live) // self._limits_b.max_model_len,
+            len(self._queue),
+        )
+        if count <= 0:
+            return []
+        admits = [self._queue.popleft() for _ in range(count)]
         self._live.update(admits)
-        if admits:
-            logger.info(
-                "admitted %d requests (live=%d, queued=%d)",
-                len(admits),
-                len(self._live),
-                len(self._queue),
-            )
+        logger.info(
+            "admitted %d requests (live=%d, queued=%d)",
+            count,
+            len(self._live),
+            len(self._queue),
+        )
         return admits
 
     def _ensure_live(self, request_ids: list[str]) -> None:
@@ -435,32 +432,6 @@ class DecisionHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             logger.exception("error handling token-decision POST")
             self.send_error(500, str(exc))
-
-
-def _validated_side_plan(
-    payload: dict[str, Any],
-    *,
-    request_ids: list[str],
-    max_model_len: int,
-    budget: int,
-    side: str,
-) -> SidePlan:
-    prompt_tokens = {str(rid): int(count) for rid, count in payload["prompt_tokens"].items()}
-    if set(prompt_tokens) != set(request_ids):
-        raise RuntimeError(f"worker {side} plan request ids do not match the run request ids")
-    for rid, count in prompt_tokens.items():
-        if count < 1:
-            raise RuntimeError(f"worker {side} reported an empty prompt for rid={rid}")
-        if count > max_model_len:
-            raise RuntimeError(
-                f"worker {side} prompt for rid={rid} is {count} tokens, over max_model_len={max_model_len}"
-            )
-        if count > budget:
-            raise RuntimeError(
-                f"worker {side} prompt for rid={rid} is {count} tokens, "
-                f"over max_num_batched_tokens={budget}"
-            )
-    return SidePlan(budget=budget, prompt_tokens=prompt_tokens)
 
 
 class JointDecoder:
@@ -602,40 +573,33 @@ class JointDecoder:
         request_ids = [f"jd-r{i:06d}" for i in range(len(prompts_a))]
         assert self._coordinator is not None
         assert self._proc_a is not None and self._proc_b is not None
-        for proc, prompts in ((self._proc_a, prompts_a), (self._proc_b, prompts_b)):
-            assert proc.stdin is not None
-            command = {
-                "command": "process_chunk",
-                "request_ids": request_ids,
-                "prompts": prompts,
-            }
-            proc.stdin.write(json.dumps(command) + "\n")
-            proc.stdin.flush()
-
-        plan_a = _validated_side_plan(
-            read_ipc(self._proc_a, expect_kind="plan"),
-            request_ids=request_ids,
-            max_model_len=self.config.model_a.max_model_len,
-            budget=self._budget_a,
-            side="a",
-        )
-        plan_b = _validated_side_plan(
-            read_ipc(self._proc_b, expect_kind="plan"),
-            request_ids=request_ids,
-            max_model_len=self.config.model_b.max_model_len,
-            budget=self._budget_b,
-            side="b",
-        )
         window = min(
             len(prompts_a),
             self.config.sampling.max_microbatch_size,
             self._max_live_requests_a,
             self._max_live_requests_b,
         )
-        initial_admit = self._coordinator.begin_run(request_ids, window, plan_a, plan_b)
-        for proc in (self._proc_a, self._proc_b):
+        initial_admit = self._coordinator.begin_run(
+            request_ids,
+            window,
+            SideLimits(
+                max_num_batched_tokens=self._budget_a,
+                max_model_len=self.config.model_a.max_model_len,
+            ),
+            SideLimits(
+                max_num_batched_tokens=self._budget_b,
+                max_model_len=self.config.model_b.max_model_len,
+            ),
+        )
+        for proc, prompts in ((self._proc_a, prompts_a), (self._proc_b, prompts_b)):
             assert proc.stdin is not None
-            proc.stdin.write(json.dumps({"command": "start", "initial_admit": initial_admit}) + "\n")
+            command = {
+                "command": "process_chunk",
+                "request_ids": request_ids,
+                "prompts": prompts,
+                "initial_admit": initial_admit,
+            }
+            proc.stdin.write(json.dumps(command) + "\n")
             proc.stdin.flush()
 
         results: dict[str, Any] = {}

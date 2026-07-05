@@ -40,8 +40,6 @@ class ScriptedCase:
     scripts_b: dict[str, list[list[int]]]
 
 
-_RAMP_FILLER = " ".join(f"filler{index}" for index in range(30))
-
 SETTINGS = (
     EndToEndSetting(
         name="two_chunks_microbatch_two",
@@ -102,45 +100,20 @@ SETTINGS = (
             StringCase("Explicit A2:", (" east road", " bends"), "Explicit B2:", (" rio largo", " canta")),
         ),
     ),
-    # Long prompts against a budget of one max_model_len force the coordinator
-    # to admit the window over several decision rounds instead of all at once.
+    # A budget of max_model_len + max_microbatch_size admits one request per
+    # decision round, forcing the window to ramp instead of filling at once.
     EndToEndSetting(
         name="budget_limited_admission_ramp",
         max_microbatch_size=4,
         top_k_a=2,
         top_k_b=2,
-        max_num_batched_tokens=128,
+        max_num_batched_tokens=132,
         cases=(
-            StringCase(
-                f"A ramp 0 {_RAMP_FILLER}:",
-                (" red apple", " on table"),
-                f"B ramp 0 {_RAMP_FILLER}:",
-                (" gato azul", " salta alto"),
-            ),
-            StringCase(
-                f"A ramp 1 {_RAMP_FILLER}:",
-                (" blue stone", " near river"),
-                f"B ramp 1 {_RAMP_FILLER}:",
-                (" perro verde", " corre lejos"),
-            ),
-            StringCase(
-                f"A ramp 2 {_RAMP_FILLER}:",
-                (" gold coin", " under sand"),
-                f"B ramp 2 {_RAMP_FILLER}:",
-                (" luna blanca", " brilla hoy"),
-            ),
-            StringCase(
-                f"A ramp 3 {_RAMP_FILLER}:",
-                (" black bird", " above trees"),
-                f"B ramp 3 {_RAMP_FILLER}:",
-                (" sol rojo", " cae tarde"),
-            ),
-            StringCase(
-                f"A ramp 4 {_RAMP_FILLER}:",
-                (" green leaf", " after rain"),
-                f"B ramp 4 {_RAMP_FILLER}:",
-                (" mar frio", " sube lento"),
-            ),
+            StringCase("Ramp A0:", (" red apple", " on table"), "Ramp B0:", (" gato azul", " salta alto")),
+            StringCase("Ramp A1:", (" blue stone", " near river"), "Ramp B1:", (" perro verde", " corre lejos")),
+            StringCase("Ramp A2:", (" gold coin", " under sand"), "Ramp B2:", (" luna blanca", " brilla hoy")),
+            StringCase("Ramp A3:", (" black bird", " above trees"), "Ramp B3:", (" sol rojo", " cae tarde")),
+            StringCase("Ramp A4:", (" green leaf", " after rain"), "Ramp B4:", (" mar frio", " sube lento")),
         ),
     ),
 )

@@ -7,7 +7,6 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from collections.abc import Iterable, Iterator
 from typing import Any
 
 import torch.distributed as dist
@@ -49,7 +48,7 @@ def run_worker(args: argparse.Namespace) -> None:
     for key, value in VLLM_GPU_ENV_VARS.items():
         os.environ[key] = value
 
-    from vllm import LLM, SamplingParams, TokensPrompt
+    from vllm import LLM, SamplingParams
     from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 
     from joint_decode_gpu.logits_processor import JointDecodeLogitsProcessor
@@ -86,8 +85,11 @@ def run_worker(args: argparse.Namespace) -> None:
             "max_live_requests": _max_live_requests(engine, get_max_concurrency_for_kv_cache_config),
         }
     )
-    commands = _commands(sys.stdin)
-    for message in commands:
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        message = json.loads(line)
         command = message.get("command")
         if command == "shutdown":
             break
@@ -97,17 +99,8 @@ def run_worker(args: argparse.Namespace) -> None:
         runtime_state.reset()
         request_ids: list[str] = message["request_ids"]
         prompts: list[str] = message["prompts"]
-        token_ids_by_rid: dict[str, list[int]] = {
-            rid: tokenizer.encode(prompt)
-            for rid, prompt in zip(request_ids, prompts, strict=True)
-        }
-        emit_ipc(
-            {
-                "kind": "plan",
-                "prompt_tokens": {rid: len(token_ids) for rid, token_ids in token_ids_by_rid.items()},
-            }
-        )
-        initial_admit = _read_start(commands)
+        initial_admit: list[str] = message["initial_admit"]
+        prompts_by_rid = dict(zip(request_ids, prompts, strict=True))
 
         live: set[str] = set()
         pending_admits: list[str] = []
@@ -121,7 +114,7 @@ def run_worker(args: argparse.Namespace) -> None:
                     raise RuntimeError(f"coordinator admitted already-live rid={rid}")
                 engine.add_request(
                     request_id=rid,
-                    prompt=TokensPrompt(prompt_token_ids=token_ids_by_rid[rid]),
+                    prompt=prompts_by_rid[rid],
                     params=SamplingParams(
                         max_tokens=args.max_tokens,
                         ignore_eos=False,
@@ -197,21 +190,6 @@ def run_worker(args: argparse.Namespace) -> None:
                 "finish_reasons": finish_reasons,
             }
         )
-
-
-def _commands(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        yield json.loads(line)
-
-
-def _read_start(commands: Iterator[dict[str, Any]]) -> list[str]:
-    start = next(commands, None)
-    if start is None or start.get("command") != "start":
-        raise RuntimeError(f"expected start command after plan, got {start!r}")
-    return [str(rid) for rid in start["initial_admit"]]
 
 
 def _drain_worker_commands() -> WorkerCommands:
