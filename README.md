@@ -26,7 +26,7 @@ Important flags:
 - `--advisor-weight`: weight on model B in the default average-logits rule.
   Model A weight is `1 - advisor_weight`.
 - `--temperature`: joint sampling temperature used by the coordinator.
-- `--max-microbatch-size`: maximum number of live requests in the synchronized
+- `--microbatch-size`: maximum number of live requests in the synchronized
   sliding window.
 - `--max-tokens`: shared side-local vLLM generation cap.
 - `--max-tokens-a`, `--max-tokens-b`: optional side-specific generation caps.

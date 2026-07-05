@@ -21,7 +21,7 @@ class StringCase:
 @dataclass(frozen=True)
 class EndToEndSetting:
     name: str
-    max_microbatch_size: int
+    microbatch_size: int
     top_k_a: int
     top_k_b: int
     max_num_batched_tokens: int | None
@@ -43,7 +43,7 @@ class ScriptedCase:
 SETTINGS = (
     EndToEndSetting(
         name="two_chunks_microbatch_two",
-        max_microbatch_size=2,
+        microbatch_size=2,
         top_k_a=4,
         top_k_b=5,
         max_num_batched_tokens=None,
@@ -57,7 +57,7 @@ SETTINGS = (
     ),
     EndToEndSetting(
         name="three_chunks_microbatch_three",
-        max_microbatch_size=3,
+        microbatch_size=3,
         top_k_a=3,
         top_k_b=3,
         max_num_batched_tokens=None,
@@ -90,7 +90,7 @@ SETTINGS = (
     ),
     EndToEndSetting(
         name="explicit_batched_tokens",
-        max_microbatch_size=2,
+        microbatch_size=2,
         top_k_a=2,
         top_k_b=2,
         max_num_batched_tokens=256,
@@ -167,11 +167,11 @@ def test_two_tokenizer_forced_string_chunks_end_to_end(
                 max_tokens_b=max(len(_flatten_steps(chunks)) for chunks in scripts_b.values()),
                 top_k_a=setting.top_k_a,
                 top_k_b=setting.top_k_b,
+                microbatch_size=setting.microbatch_size,
                 max_num_batched_tokens=setting.max_num_batched_tokens,
                 barrier_timeout_s=60.0,
                 seed=0,
                 stop=(),
-                max_microbatch_size=setting.max_microbatch_size,
             ),
         )
 
@@ -360,11 +360,11 @@ def _run_scripted_case(
             max_tokens_b=max_tokens_b,
             top_k_a=3,
             top_k_b=3,
+            microbatch_size=2,
             max_num_batched_tokens=None,
             barrier_timeout_s=60.0,
             seed=0,
             stop=stop,
-            max_microbatch_size=2,
         ),
     )
     try:

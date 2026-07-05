@@ -412,8 +412,6 @@ class JointDecoder:
         self._http_thread: threading.Thread | None = None
         self._proc_a: subprocess.Popen | None = None
         self._proc_b: subprocess.Popen | None = None
-        self._max_live_requests_a = 0
-        self._max_live_requests_b = 0
 
     def __enter__(self) -> JointDecoder:
         self._coordinator = Coordinator(
@@ -441,10 +439,8 @@ class JointDecoder:
                 max_tokens=self.config.sampling.max_tokens_b,
                 decision_url=f"http://127.0.0.1:{actual_port}/b",
             )
-            handshake_a = read_ipc(self._proc_a, expect_kind="handshake")
-            handshake_b = read_ipc(self._proc_b, expect_kind="handshake")
-            self._max_live_requests_a = int(handshake_a["max_live_requests"])
-            self._max_live_requests_b = int(handshake_b["max_live_requests"])
+            read_ipc(self._proc_a, expect_kind="handshake")
+            read_ipc(self._proc_b, expect_kind="handshake")
         except Exception:
             self.__exit__(None, None, None)
             raise
@@ -468,7 +464,6 @@ class JointDecoder:
         for key, value in VLLM_GPU_ENV_VARS.items():
             env[key] = value
 
-        max_num_seqs, max_num_batched_tokens = self._worker_scheduler_args(model_config)
         cmd = [
             sys.executable,
             "-u",
@@ -481,9 +476,9 @@ class JointDecoder:
             "--max-model-len",
             str(model_config.max_model_len),
             "--max-num-seqs",
-            str(max_num_seqs),
+            str(self.config.sampling.microbatch_size),
             "--max-num-batched-tokens",
-            str(max_num_batched_tokens),
+            str(self._max_num_batched_tokens(model_config)),
             "--seed",
             str(self.config.sampling.seed),
         ]
@@ -506,22 +501,18 @@ class JointDecoder:
             bufsize=1,
         )
 
-    def _worker_scheduler_args(self, model_config: JointDecodeModelConfig) -> tuple[int, int]:
-        max_num_seqs = self.config.sampling.max_microbatch_size
+    def _max_num_batched_tokens(self, model_config: JointDecodeModelConfig) -> int:
         configured = self.config.sampling.max_num_batched_tokens
+        required = self.config.sampling.microbatch_size * model_config.max_model_len
         if configured is None:
-            return max_num_seqs, max_num_seqs * model_config.max_model_len
-        if configured < model_config.max_model_len:
+            return required
+        if configured < required:
             raise ValueError(
-                f"max_num_batched_tokens={configured} is smaller than "
-                f"max_model_len={model_config.max_model_len}"
+                f"max_num_batched_tokens={configured} is too small for "
+                f"microbatch_size={self.config.sampling.microbatch_size} and "
+                f"max_model_len={model_config.max_model_len}; need at least {required}"
             )
-        if configured < max_num_seqs:
-            raise ValueError(
-                f"max_num_batched_tokens={configured} is smaller than "
-                f"max_num_seqs={max_num_seqs}"
-            )
-        return max_num_seqs, configured
+        return configured
 
     def generate(self, prompts_a: list[str], prompts_b: list[str]) -> list[GenerateOutput]:
         if len(prompts_a) != len(prompts_b):
@@ -531,13 +522,7 @@ class JointDecoder:
     def _generate_run(self, prompts_a: list[str], prompts_b: list[str]) -> list[GenerateOutput]:
         request_ids = [f"jd-r{i:06d}" for i in range(len(prompts_a))]
         assert self._coordinator is not None
-        window = min(
-            len(prompts_a),
-            self.config.sampling.max_microbatch_size,
-            self._max_live_requests_a,
-            self._max_live_requests_b,
-        )
-        initial_admit = self._coordinator.begin_run(request_ids, window)
+        initial_admit = self._coordinator.begin_run(request_ids, self.config.sampling.microbatch_size)
         for proc, prompts in ((self._proc_a, prompts_a), (self._proc_b, prompts_b)):
             assert proc is not None and proc.stdin is not None
             command = {

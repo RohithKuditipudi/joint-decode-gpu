@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import os
 import sys
 import urllib.error
@@ -50,7 +49,6 @@ def run_worker(args: argparse.Namespace) -> None:
         os.environ[key] = value
 
     from vllm import LLM, SamplingParams
-    from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 
     from joint_decode_gpu.logits_processor import JointDecodeLogitsProcessor
 
@@ -76,20 +74,11 @@ def run_worker(args: argparse.Namespace) -> None:
     llm = LLM(**kwargs)
     tokenizer = llm.get_tokenizer()
     eos_id = tokenizer.eos_token_id
+    emit_ipc({"kind": "handshake"})
     stop = list(json.loads(args.stop)) if args.stop is not None else None
 
     engine = llm.llm_engine
     _validate_engine(engine, args.max_num_seqs, args.max_num_batched_tokens)
-    emit_ipc(
-        {
-            "kind": "handshake",
-            "max_live_requests": _max_live_requests(
-                engine,
-                get_max_concurrency_for_kv_cache_config,
-                args.max_model_len,
-            ),
-        }
-    )
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
@@ -238,19 +227,6 @@ def _scheduler(engine: Any) -> Any:
     if scheduler is None:
         raise RuntimeError("vLLM engine does not expose engine.engine_core.engine_core.scheduler")
     return scheduler
-
-
-def _max_live_requests(engine: Any, concurrency_fn: Any, max_model_len: int) -> int:
-    scheduler = _scheduler(engine)
-    max_concurrency = concurrency_fn(
-        engine.vllm_config,
-        scheduler.kv_cache_config,
-    )
-    return min(
-        math.floor(max_concurrency),
-        scheduler.scheduler_config.max_num_seqs,
-        scheduler.scheduler_config.max_num_batched_tokens // max_model_len,
-    )
 
 
 def _validate_engine(engine: Any, max_num_seqs: int, max_num_batched_tokens: int) -> None:

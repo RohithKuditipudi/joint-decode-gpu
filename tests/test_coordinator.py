@@ -6,8 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from joint_decode_gpu.config import JointDecodeConfig, JointDecodeModelConfig, JointDecodeSamplingConfig
-from joint_decode_gpu.coordinator import Coordinator, JointDecoder, Side
+from joint_decode_gpu.coordinator import Coordinator, Side
 
 
 def test_decode_pair_returns_side_local_token_lists() -> None:
@@ -150,32 +149,6 @@ def test_control_decode_aborts_when_decode_side_still_needs_peer_logits() -> Non
         future_decode.result()
 
 
-def test_worker_scheduler_args_derives_default_batched_tokens() -> None:
-    decoder = JointDecoder(_config(max_microbatch_size=7, max_model_len=128), select_token=lambda *_args, **_kwargs: 0)
-
-    assert decoder._worker_scheduler_args(decoder.config.model_a) == (7, 896)
-
-
-def test_worker_scheduler_args_rejects_batched_tokens_below_model_len() -> None:
-    decoder = JointDecoder(
-        _config(max_microbatch_size=7, max_model_len=128, max_num_batched_tokens=64),
-        select_token=lambda *_args, **_kwargs: 0,
-    )
-
-    with pytest.raises(ValueError, match="max_model_len"):
-        decoder._worker_scheduler_args(decoder.config.model_a)
-
-
-def test_worker_scheduler_args_rejects_batched_tokens_below_max_num_seqs() -> None:
-    decoder = JointDecoder(
-        _config(max_microbatch_size=256, max_model_len=128, max_num_batched_tokens=192),
-        select_token=lambda *_args, **_kwargs: 0,
-    )
-
-    with pytest.raises(ValueError, match="max_num_seqs"):
-        decoder._worker_scheduler_args(decoder.config.model_a)
-
-
 def _coordinator(selector) -> Coordinator:
     return Coordinator(
         timeout_s=1.0,
@@ -198,37 +171,6 @@ def _control(side: str) -> dict[str, object]:
         "kind": "control",
         "side": side,
     }
-
-
-def _config(
-    *,
-    max_microbatch_size: int,
-    max_model_len: int,
-    max_num_batched_tokens: int | None = None,
-) -> JointDecodeConfig:
-    model = JointDecodeModelConfig(
-        model_path="model",
-        gpu_index=0,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=None,
-        enable_prefix_caching=False,
-        enforce_eager=True,
-    )
-    return JointDecodeConfig(
-        model_a=model,
-        model_b=model,
-        sampling=JointDecodeSamplingConfig(
-            max_tokens_a=8,
-            max_tokens_b=8,
-            top_k_a=4,
-            top_k_b=4,
-            max_num_batched_tokens=max_num_batched_tokens,
-            barrier_timeout_s=1.0,
-            seed=0,
-            stop=(),
-            max_microbatch_size=max_microbatch_size,
-        ),
-    )
 
 
 def _wait_for_pending_decode(coordinator: Coordinator, side: Side) -> None:
